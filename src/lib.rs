@@ -2,5 +2,7 @@
 //! them, and sends them to Discord over UDP.
 
 pub mod frame;
+pub mod rtp;
 
 pub use frame::{OPUS_SILENCE_FRAME, SAMPLES_PER_FRAME, SILENCE_FRAME_COUNT};
+pub use rtp::RtpHeader;
