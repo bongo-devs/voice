@@ -44,7 +44,7 @@ impl VoiceUdp {
     /// Perform Discord IP discovery: send a 74-byte request and parse the reply for our public
     /// address. See <https://discord.com/developers/docs/topics/voice-connections#ip-discovery>.
     ///
-    /// The request is resent once a second for up to [`DISCOVERY_ATTEMPTS`] tries, and any datagram
+    /// The request is resent once a second for up to `DISCOVERY_ATTEMPTS` tries, and any datagram
     /// that isn't exactly 74 bytes long is ignored rather than treated as a failure. Without this a
     /// single dropped UDP packet would wedge the whole voice handshake forever.
     pub async fn discover_ip(&self, ssrc: u32) -> io::Result<DiscoveredAddress> {
