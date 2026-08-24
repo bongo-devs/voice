@@ -8,6 +8,7 @@ pub mod provider;
 pub mod rtp;
 pub mod sink;
 pub mod transport;
+pub mod udp;
 
 pub use dave::DaveEncryptor;
 pub use event::{EventDispatcher, VoiceEvent, VoiceEventAdapter, VoiceEventListener};
@@ -19,3 +20,4 @@ pub use transport::{
     choose_mode, cipher_for_mode, select_cipher, AesGcmRtpSize, PlainTransport, TransportCipher,
     XChaCha20Poly1305RtpSize,
 };
+pub use udp::{DiscoveredAddress, VoiceUdp};
