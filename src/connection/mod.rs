@@ -770,7 +770,7 @@ mod tests {
 
     #[test]
     fn resume_backoff_grows_and_stays_bounded() {
-        // Every player on the node drops together when a voice server cycles, so the delay must
+        // Every connection on a host drops together when a voice server cycles, so the delay must
         // grow and carry jitter — but stay inside the gateway's own session-resume window.
         let delays: Vec<Duration> = (0..5).map(backoff_delay).collect();
         for pair in delays.windows(2) {

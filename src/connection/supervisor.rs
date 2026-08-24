@@ -65,8 +65,8 @@ pub(super) async fn gateway_loop(
                     );
                     state.store(ConnectionState::Reconnecting as u8, Ordering::SeqCst);
                     // Best-effort resume: reconnect and send op 7 with the last seen sequence.
-                    // Exponential backoff with jitter — every player in a node drops together when
-                    // Discord cycles a voice server, and a fixed schedule would have them all
+                    // Exponential backoff with jitter — every connection on a host drops together
+                    // when Discord cycles a voice server, and a fixed schedule would have them all
                     // reconnect in lockstep.
                     for attempt in 0..5u32 {
                         sleep(backoff_delay(attempt)).await;

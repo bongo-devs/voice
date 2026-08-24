@@ -206,7 +206,7 @@ impl<P: OpusFrameProvider, S: FrameSink> FramePacer<P, S> {
         self.packet.extend_from_slice(payload);
 
         // Drop the frame on an AEAD failure: sending the plaintext would leak audio, and this runs
-        // on a shared runtime worker where a panic would take unrelated players down with it.
+        // on a shared runtime worker where a panic would take unrelated connections down with it.
         if let Err(cause) = self
             .transport
             .encrypt_in_place(&mut self.packet, header_bytes.len())
