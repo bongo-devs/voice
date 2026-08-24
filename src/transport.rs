@@ -29,7 +29,7 @@ pub trait TransportCipher: Send {
     ///
     /// Returns `Err` if the AEAD refuses the input. The caller must **drop the frame**, never send
     /// it: emitting the plaintext would leak audio, and a panic here would take down the shared
-    /// runtime worker (koe logs and drops instead).
+    /// runtime worker.
     fn encrypt_in_place(
         &mut self,
         packet: &mut Vec<u8>,
