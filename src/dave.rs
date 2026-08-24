@@ -59,10 +59,9 @@ impl DaveEncryptor {
     /// Reset and re-initialise the session for a new MLS group (Discord's new-epoch re-key, e.g.
     /// after a member leaves/rejoins the voice channel).
     ///
-    /// Mirrors koe's `prepareEpoch` → `daveSession.init(...)`: davey's [`DaveSession::reinit`] tears
-    /// down the old group, generates fresh credentials, and re-creates a pending group, so the new
-    /// group's proposals/welcome are accepted instead of being rejected with `Wrong Epoch` /
-    /// `AlreadyInGroup`. Reuses this session's own protocol version + user/channel ids.
+    /// Tears down the old group, generates fresh credentials, and re-creates a pending group, so
+    /// the new group's proposals/welcome are accepted instead of being rejected with `Wrong Epoch`
+    /// / `AlreadyInGroup`. Reuses this session's own protocol version + user/channel ids.
     pub fn reinit(&mut self) -> Result<(), davey::errors::ReinitError> {
         let version = self.session.protocol_version();
         let user_id = self.session.user_id();
@@ -76,9 +75,9 @@ impl DaveEncryptor {
         self.session.set_passthrough_mode(enabled, None);
     }
 
-    /// Tear down the current MLS group and clear key material, mirroring koe's `daveSession.reset()`
-    /// on a DAVE downgrade to protocol v0 (`executeTransition`). After this the session is INACTIVE
-    /// and frames pass through unencrypted, as expected when E2EE is disabled.
+    /// Tear down the current MLS group and clear key material, for a DAVE downgrade to protocol
+    /// v0. After this the session is INACTIVE and frames pass through unencrypted, as expected when
+    /// E2EE is disabled.
     pub fn reset(&mut self) {
         if let Err(error) = self.session.reset() {
             tracing::warn!(%error, "DAVE: failed to reset session");
