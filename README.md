@@ -67,12 +67,18 @@ listeners added later miss the events that fire during it.
 
 ## Credits
 
-- [koe](https://github.com/KyokoBot/koe) — the JVM Discord voice library, a reference for how the
-  voice gateway is driven in practice.
-- [davey](https://github.com/Snazzah/davey) — the Rust DAVE/MLS implementation this crate builds on.
+The voice gateway connection logic in this crate is derived from
+[koe](https://github.com/KyokoBot/koe) by Alula — the connection lifecycle and handshake
+sequencing, the resumable close-code set, the DAVE/MLS op handling and transition flow, and the
+speaking re-announce behaviour all follow koe's design, reimplemented in Rust. koe is MIT licensed
+(Copyright (c) 2019 Alula); its full notice is reproduced in [LICENSE](LICENSE).
+
+Also relied on:
+
+- [davey](https://github.com/Snazzah/davey) — the Rust DAVE/MLS implementation this crate depends on.
 - [The DAVE protocol](https://daveprotocol.com/) — Discord's specification for end-to-end encrypted
   voice.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE), which also carries the third-party notice for koe.
