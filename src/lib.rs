@@ -4,6 +4,7 @@
 pub mod dave;
 pub mod event;
 pub mod frame;
+pub mod pacer;
 pub mod provider;
 pub mod rtp;
 pub mod sink;
@@ -13,6 +14,7 @@ pub mod udp;
 pub use dave::DaveEncryptor;
 pub use event::{EventDispatcher, VoiceEvent, VoiceEventAdapter, VoiceEventListener};
 pub use frame::{OPUS_SILENCE_FRAME, SAMPLES_PER_FRAME, SILENCE_FRAME_COUNT};
+pub use pacer::{FramePacer, PacerStatus};
 pub use provider::OpusFrameProvider;
 pub use rtp::RtpHeader;
 pub use sink::{FrameSink, UdpFrameSink, VecSink};
