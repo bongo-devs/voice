@@ -31,7 +31,7 @@ const MAX_CATCHUP_FRAMES: u64 = 3;
 /// from wherever we are now" — a tick that runs late is followed immediately by the next one instead
 /// of pushing the whole schedule out, so lateness never accumulates against Discord's RTP timeline.
 /// (`tokio::time::interval` with `MissedTickBehavior::Delay` does accumulate it; `Burst` catches up
-/// without bound and `Skip` never catches up at all.) More than [`MAX_CATCHUP_FRAMES`] behind, the
+/// without bound and `Skip` never catches up at all.) More than `MAX_CATCHUP_FRAMES` behind, the
 /// clock gives up on the gap and restarts from now, counting the slots it skipped in
 /// [`dropped_frames`](Self::dropped_frames).
 pub struct FrameClock {
