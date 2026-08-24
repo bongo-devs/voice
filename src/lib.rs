@@ -4,7 +4,9 @@
 pub mod frame;
 pub mod provider;
 pub mod rtp;
+pub mod sink;
 
 pub use frame::{OPUS_SILENCE_FRAME, SAMPLES_PER_FRAME, SILENCE_FRAME_COUNT};
 pub use provider::OpusFrameProvider;
 pub use rtp::RtpHeader;
+pub use sink::{FrameSink, UdpFrameSink, VecSink};
