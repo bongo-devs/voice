@@ -2,6 +2,7 @@
 //! them, and sends them to Discord over UDP.
 
 pub mod dave;
+pub mod event;
 pub mod frame;
 pub mod provider;
 pub mod rtp;
@@ -9,6 +10,7 @@ pub mod sink;
 pub mod transport;
 
 pub use dave::DaveEncryptor;
+pub use event::{EventDispatcher, VoiceEvent, VoiceEventAdapter, VoiceEventListener};
 pub use frame::{OPUS_SILENCE_FRAME, SAMPLES_PER_FRAME, SILENCE_FRAME_COUNT};
 pub use provider::OpusFrameProvider;
 pub use rtp::RtpHeader;
