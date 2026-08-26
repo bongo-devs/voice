@@ -1,9 +1,5 @@
 //! Voice connection events and listener dispatch.
-//!
-//! A [`VoiceConnection`](crate::connection::VoiceConnection) dispatches [`VoiceEvent`]s to
-//! registered listeners as its lifecycle progresses: the gateway becoming ready, the DAVE
-//! session activating, other users joining/leaving, and the gateway closing or erroring.
-//! Listeners are invoked synchronously and must not block.
+//! Listeners are invoked synchronously on the gateway task and must not block.
 
 use std::sync::{Arc, Mutex};
 
@@ -68,9 +64,7 @@ pub enum VoiceEvent {
     },
 }
 
-/// A listener for [`VoiceEvent`]s.
-///
-/// Invoked synchronously on a gateway/send task; handlers must be quick and must not block.
+/// A listener for [`VoiceEvent`]s, invoked synchronously on the gateway task. Must not block.
 pub trait VoiceEventListener: Send + Sync {
     /// Handle an event.
     fn on_event(&self, event: &VoiceEvent);
