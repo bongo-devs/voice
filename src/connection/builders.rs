@@ -52,8 +52,8 @@ pub(super) fn transition_ready_message(transition_id: u64) -> Message {
     Message::text(json!({ "op": 23, "d": { "transition_id": transition_id } }).to_string())
 }
 
-/// Client→server DAVE binary frame: `[op][payload]` (the 2-byte sequence prefix is a
-/// server→client field only; the client acks via `seq_ack` in the heartbeat).
+/// Outbound DAVE binary frame: `[op][payload]`. The 2-byte sequence prefix is inbound-only; we ack
+/// with `seq_ack` in the heartbeat instead.
 pub(super) fn dave_binary(op: u8, payload: &[u8]) -> Message {
     let mut buf = Vec::with_capacity(1 + payload.len());
     buf.push(op);
