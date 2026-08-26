@@ -1,35 +1,17 @@
-//! Transport-layer encryption for the voice UDP packets.
-//!
-//! Discord requires the RTP payload to be encrypted on the wire. This is **separate from and
-//! below** DAVE end-to-end encryption: the Opus frame is first DAVE-encrypted, then the result
-//! is transport-encrypted here before being placed after the RTP header.
-//!
-//! Two AEAD `_rtpsize` modes are implemented:
-//! - [`AesGcmRtpSize`] — `aead_aes256_gcm_rtpsize` (preferred when the platform has AES
-//!   hardware), 12-byte nonce.
-//! - [`XChaCha20Poly1305RtpSize`] — `aead_xchacha20_poly1305_rtpsize`, the mode every client is
-//!   required to support, 24-byte nonce.
-//!
-//! In both modes the nonce is a 32-bit big-endian counter in the first 4 bytes (rest zero), the
-//! RTP header is the AEAD associated data, the 16-byte tag follows the ciphertext, and the 4-byte
-//! counter is appended as the packet suffix so the receiver can reconstruct the nonce.
+//! Transport encryption for the voice UDP packets, layered under DAVE: the Opus frame is
+//! DAVE-encrypted first, then encrypted here before it goes after the RTP header.
 
-use aes_gcm::aead::{AeadInPlace, KeyInit};
-use aes_gcm::{Aes256Gcm, Nonce as GcmNonce};
-use chacha20poly1305::{Key as XKey, XChaCha20Poly1305, XNonce};
+use aes_gcm::aead::{AeadInPlace, KeyInit, Nonce};
+use aes_gcm::Aes256Gcm;
+use chacha20poly1305::{Key as XKey, XChaCha20Poly1305};
 
 /// Encrypts an RTP payload for transport, in place, inside the packet buffer.
 pub trait TransportCipher: Send {
     /// The negotiated mode's wire name.
     fn mode(&self) -> &'static str;
 
-    /// Encrypt the payload region of `packet` — everything from `header_len` onwards — using
-    /// `packet[..header_len]` (the RTP header) as associated data, then append the 16-byte tag and
-    /// the 4-byte nonce suffix. On return `packet` is the complete wire packet.
-    ///
-    /// Returns `Err` if the AEAD refuses the input. The caller must **drop the frame**, never send
-    /// it: emitting the plaintext would leak audio, and a panic here would take down the shared
-    /// runtime worker.
+    /// Encrypt `packet[header_len..]` with the RTP header as associated data, then append the tag
+    /// and the 4-byte nonce suffix. On `Err` the caller must drop the frame, never send it.
     fn encrypt_in_place(
         &mut self,
         packet: &mut Vec<u8>,
@@ -37,13 +19,28 @@ pub trait TransportCipher: Send {
     ) -> Result<(), &'static str>;
 }
 
-/// Build the next `N`-byte AEAD nonce from a 32-bit counter (counter in the first 4 bytes,
-/// big-endian, the rest zero), returning the nonce bytes and the 4-byte suffix to append.
-fn rtpsize_nonce<const N: usize>(counter: u32) -> ([u8; N], [u8; 4]) {
-    let mut nonce = [0u8; N];
+/// Encrypt in place with a 32-bit big-endian counter nonce, then append the 16-byte tag and the
+/// 4-byte counter suffix the receiver needs to rebuild the nonce.
+fn encrypt_rtpsize<C: AeadInPlace>(
+    cipher: &C,
+    counter: &mut u32,
+    packet: &mut Vec<u8>,
+    header_len: usize,
+    fail: &'static str,
+) -> Result<(), &'static str> {
     let suffix = counter.to_be_bytes();
+    *counter = counter.wrapping_add(1);
+
+    let mut nonce = Nonce::<C>::default();
     nonce[..4].copy_from_slice(&suffix);
-    (nonce, suffix)
+
+    let (aad, msg) = packet.split_at_mut(header_len);
+    let tag = cipher
+        .encrypt_in_place_detached(&nonce, aad, msg)
+        .map_err(|_| fail)?;
+    packet.extend_from_slice(tag.as_slice());
+    packet.extend_from_slice(&suffix);
+    Ok(())
 }
 
 /// `aead_aes256_gcm_rtpsize` transport encryption.
@@ -77,22 +74,17 @@ impl TransportCipher for AesGcmRtpSize {
         packet: &mut Vec<u8>,
         header_len: usize,
     ) -> Result<(), &'static str> {
-        let counter = self.nonce_counter;
-        self.nonce_counter = self.nonce_counter.wrapping_add(1);
-
-        let (nonce_bytes, suffix) = rtpsize_nonce::<12>(counter);
-        let (aad, msg) = packet.split_at_mut(header_len);
-        let tag = self
-            .cipher
-            .encrypt_in_place_detached(GcmNonce::from_slice(&nonce_bytes), aad, msg)
-            .map_err(|_| "AES-GCM encryption failed")?;
-        packet.extend_from_slice(tag.as_slice());
-        packet.extend_from_slice(&suffix);
-        Ok(())
+        encrypt_rtpsize(
+            &self.cipher,
+            &mut self.nonce_counter,
+            packet,
+            header_len,
+            "AES-GCM encryption failed",
+        )
     }
 }
 
-/// `aead_xchacha20_poly1305_rtpsize` transport encryption — the mandatory-to-support mode.
+/// `aead_xchacha20_poly1305_rtpsize` transport encryption, the mode every client must support.
 pub struct XChaCha20Poly1305RtpSize {
     cipher: XChaCha20Poly1305,
     nonce_counter: u32,
@@ -124,24 +116,18 @@ impl TransportCipher for XChaCha20Poly1305RtpSize {
         packet: &mut Vec<u8>,
         header_len: usize,
     ) -> Result<(), &'static str> {
-        let counter = self.nonce_counter;
-        self.nonce_counter = self.nonce_counter.wrapping_add(1);
-
-        let (nonce_bytes, suffix) = rtpsize_nonce::<24>(counter);
-        let (aad, msg) = packet.split_at_mut(header_len);
-        let tag = self
-            .cipher
-            .encrypt_in_place_detached(XNonce::from_slice(&nonce_bytes), aad, msg)
-            .map_err(|_| "XChaCha20-Poly1305 encryption failed")?;
-        packet.extend_from_slice(tag.as_slice());
-        packet.extend_from_slice(&suffix);
-        Ok(())
+        encrypt_rtpsize(
+            &self.cipher,
+            &mut self.nonce_counter,
+            packet,
+            header_len,
+            "XChaCha20-Poly1305 encryption failed",
+        )
     }
 }
 
-/// Choose a transport mode from the ones the server offered, preferring AES-256-GCM (hardware
-/// accelerated where available) and falling back to the always-supported XChaCha20-Poly1305.
-/// Returns the chosen mode's wire name (to announce in `SELECT_PROTOCOL`).
+/// Pick a mode from those the server offered, preferring AES-256-GCM, and return its wire name
+/// to announce in `SELECT_PROTOCOL`.
 pub fn choose_mode(modes: &[String]) -> Option<&'static str> {
     if modes.iter().any(|m| m == AesGcmRtpSize::MODE) {
         Some(AesGcmRtpSize::MODE)
@@ -165,8 +151,7 @@ pub fn cipher_for_mode(mode: &str, secret_key: &[u8]) -> Result<Box<dyn Transpor
     }
 }
 
-/// Pick and build a transport cipher for the offered modes (combines [`choose_mode`] and
-/// [`cipher_for_mode`]).
+/// Pick and build a transport cipher for the offered modes.
 pub fn select_cipher(
     modes: &[String],
     secret_key: &[u8],
@@ -179,7 +164,7 @@ pub fn select_cipher(
     }
 }
 
-/// No transport encryption (local testing only — never accepted by Discord).
+/// No transport encryption, for local testing only. Discord never accepts it.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PlainTransport;
 
@@ -201,8 +186,9 @@ impl TransportCipher for PlainTransport {
 mod tests {
     use super::*;
     use aes_gcm::aead::{Aead, Payload};
+    use aes_gcm::Nonce as GcmNonce;
+    use chacha20poly1305::XNonce;
 
-    /// Build the packet buffer the pacer hands to the cipher: header followed by payload.
     fn packet_of(header: &[u8], payload: &[u8]) -> Vec<u8> {
         let mut packet = Vec::with_capacity(header.len() + payload.len() + 20);
         packet.extend_from_slice(header);
@@ -274,7 +260,6 @@ mod tests {
         assert_eq!(plain, payload);
     }
 
-    /// The nonce counter must advance per frame, so two identical frames encrypt differently.
     #[test]
     fn nonce_counter_advances_per_frame() {
         let mut cipher = AesGcmRtpSize::new(&[3u8; 32]).unwrap();

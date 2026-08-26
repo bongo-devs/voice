@@ -8,13 +8,9 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use tokio::net::UdpSocket;
 
-/// A destination for RTP packets. Implementors send each packet (already RTP-framed and
-/// encrypted) somewhere — a UDP socket to Discord, an in-memory buffer, a file, etc.
-///
-/// The packet is borrowed so the [`FramePacer`](crate::pacer::FramePacer) can build every frame in
-/// one reused buffer: a real sink writes the bytes to a socket and never needs to own them.
+/// A destination for RTP packets, already framed and encrypted.
 pub trait FrameSink: Send {
-    /// Send one packet.
+    /// Send one packet. Borrowed, not owned, so the pacer can reuse one buffer for every frame.
     fn send(&mut self, packet: &[u8]) -> impl Future<Output = io::Result<()>> + Send;
 }
 
@@ -43,7 +39,7 @@ impl FrameSink for UdpFrameSink {
     }
 }
 
-/// Collects packets in memory — useful for tests and capture.
+/// Collects packets in memory, for tests and capture.
 #[derive(Debug, Default, Clone)]
 pub struct VecSink {
     packets: Arc<Mutex<Vec<Bytes>>>,

@@ -1,29 +1,5 @@
-//! # voice
-//!
-//! The Discord voice send layer: a producer hands over 20 ms Opus frames, and this crate pulls them
-//! at a steady 20 ms cadence, wraps them in RTP, encrypts them, and sends them to Discord over UDP.
-//!
-//! ```text
-//!   ┌─────────────────────────────────┐
-//!   │  OpusFrameProvider              │
-//!   │      │ provide() (20ms Opus)    │
-//!   │      ▼                          │
-//!   │  FramePacer (20ms clock)        │
-//!   │      │ DAVE + transport + RTP   │
-//!   │      ▼                          │
-//!   │  FrameSink ──▶ UDP/Discord      │
-//!   └─────────────────────────────────┘
-//! ```
-//!
-//! End-to-end encryption is **DAVE** ([`dave`], backed by the [`davey`](https://docs.rs/davey)
-//! crate) — Discord's current MLS-based voice encryption — layered over the required AEAD transport
-//! ciphers ([`transport`]: `aead_aes256_gcm_rtpsize` and `aead_xchacha20_poly1305_rtpsize`).
-//!
-//! Implemented here: the producer/consumer [`provider`] contract, DAVE encryption via [`dave`],
-//! [`rtp`] packetization, the unified 20 ms [`pacer`] (DAVE → transport → RTP → sink), pluggable
-//! [`sink`]s (UDP + in-memory), and a live [`connection`] that drives the v8 WebSocket, UDP IP
-//! discovery, the full DAVE MLS handshake + transitions (ops 21–31), heartbeats with `seq_ack`,
-//! and resume-on-disconnect.
+//! The Discord voice send layer: a producer hands over 20 ms Opus frames, and this crate paces,
+//! encrypts, RTP-frames, and sends them over UDP, with DAVE end-to-end encryption on top.
 
 pub mod connection;
 pub mod dave;

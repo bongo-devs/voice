@@ -1,10 +1,5 @@
-//! The 20 ms frame pacer, and the single send engine used by both the standalone API and the live
-//! [`VoiceConnection`](crate::connection).
-//!
-//! Each tick it pulls one frame from an [`OpusFrameProvider`], DAVE end-to-end encrypts it via
-//! [`DaveEncryptor`], applies the negotiated [`TransportCipher`], RTP-frames it, and hands the
-//! finished packet to a [`FrameSink`]. When the provider has nothing, it emits up to
-//! [`SILENCE_FRAME_COUNT`] silence frames (so Discord stops cleanly), then goes idle.
+//! The 20 ms frame pacer: pull a frame, DAVE-encrypt it, transport-encrypt it, RTP-frame it, send.
+//! With nothing to send it drains [`SILENCE_FRAME_COUNT`] silence frames, then goes idle.
 
 use std::io;
 
@@ -17,23 +12,15 @@ use crate::rtp::RtpHeader;
 use crate::sink::FrameSink;
 use crate::transport::{PlainTransport, TransportCipher};
 
-/// Capacity reserved for the reused packet buffer: RTP header + a worst-case Opus frame (plus the
-/// DAVE frame overhead) + AEAD tag + nonce suffix, rounded up under one Ethernet MTU.
+/// Reused buffer size: header + worst-case DAVE/Opus payload + tag + suffix, under one MTU.
 const MAX_PACKET_BYTES: usize = 1400;
 
 /// Past three missed slots the clock stops trying to catch up and resynchronises to now, so a long
 /// stall doesn't produce a burst of stale frames.
 const MAX_CATCHUP_FRAMES: u64 = 3;
 
-/// The 20 ms frame clock.
-///
-/// Each slot has an **absolute** deadline (`last_frame_time + frame_interval`), not "sleep 20 ms
-/// from wherever we are now" — a tick that runs late is followed immediately by the next one instead
-/// of pushing the whole schedule out, so lateness never accumulates against Discord's RTP timeline.
-/// (`tokio::time::interval` with `MissedTickBehavior::Delay` does accumulate it; `Burst` catches up
-/// without bound and `Skip` never catches up at all.) More than `MAX_CATCHUP_FRAMES` behind, the
-/// clock gives up on the gap and restarts from now, counting the slots it skipped in
-/// [`dropped_frames`](Self::dropped_frames).
+/// The 20 ms frame clock. Slot deadlines are absolute, so a tick that runs late is followed
+/// immediately by the next one and lateness never accumulates against Discord's RTP timeline.
 pub struct FrameClock {
     next: Instant,
     dropped: u64,
@@ -55,9 +42,7 @@ impl FrameClock {
     }
 
     /// Wait for the next frame slot, returning how many slots were missed (`0` when on time).
-    ///
-    /// Cancel-safe: the deadline is absolute and is only advanced after the sleep completes, so
-    /// dropping this future (e.g. losing a `select!` race) leaves the cadence untouched.
+    /// Cancel-safe: the deadline only advances after the sleep, so losing a `select!` race is free.
     pub async fn wait(&mut self) -> u64 {
         let now = Instant::now();
         if now < self.next {
@@ -88,8 +73,7 @@ impl FrameClock {
 /// What a single [`FramePacer::tick`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacerStatus {
-    /// An audio frame was processed (sent, or dropped because DAVE encryption failed while the
-    /// group was active — dropping is correct, never emit plaintext to peers).
+    /// An audio frame was processed: sent, or dropped because DAVE encryption failed.
     Sent,
     /// A silence frame was sent (draining after audio stopped).
     Silence,
@@ -114,8 +98,8 @@ pub struct FramePacer<P: OpusFrameProvider, S: FrameSink> {
 }
 
 impl<P: OpusFrameProvider, S: FrameSink> FramePacer<P, S> {
-    /// Create a pacer with **no transport encryption** (local testing only — Discord rejects
-    /// unencrypted packets). Use [`with_transport`](Self::with_transport) for a real connection.
+    /// Create a pacer with no transport encryption, for local testing only. Discord rejects
+    /// unencrypted packets, so a real connection needs [`with_transport`](Self::with_transport).
     pub fn new(provider: P, sink: S, dave: DaveEncryptor, ssrc: u32) -> Self {
         Self::with_transport(provider, sink, dave, Box::new(PlainTransport), ssrc)
     }
@@ -194,10 +178,8 @@ impl<P: OpusFrameProvider, S: FrameSink> FramePacer<P, S> {
         }
     }
 
-    /// RTP-frame, transport-encrypt, and send one (already DAVE-processed) payload.
-    ///
-    /// The whole packet is assembled in [`Self::packet`] and encrypted in place, so a steady-state
-    /// frame costs zero allocations.
+    /// RTP-frame, transport-encrypt, and send one already-DAVE-processed payload.
+    /// Assembled in place in `self.packet`, so a steady-state frame costs zero allocations.
     async fn send(&mut self, payload: &[u8]) -> io::Result<()> {
         let header_bytes = self.header.to_bytes();
 
@@ -235,9 +217,6 @@ impl<P: OpusFrameProvider, S: FrameSink> FramePacer<P, S> {
 mod tests {
     use super::*;
 
-    /// A late slot runs immediately (the deadline stays absolute, so the cadence recovers instead
-    /// of drifting), and past `MAX_CATCHUP_FRAMES` the clock gives up on the gap and restarts from
-    /// now. Lateness is faked by moving the deadline back rather than by sleeping through it.
     #[tokio::test]
     async fn frame_clock_catches_up_a_late_slot_then_resynchronises() {
         let start = Instant::now();

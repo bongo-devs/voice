@@ -1,11 +1,5 @@
-//! DAVE (Discord Audio & Video End-to-end encryption) — the **only** supported encryption path,
-//! backed by the [`davey`] crate.
-//!
-//! Discord's voice now uses the DAVE protocol (MLS-based E2E); the legacy transport-only modes
-//! (`xsalsa20_poly1305`, `aead_*_rtpsize`) are not used here. [`DaveEncryptor`] wraps a
-//! [`davey::DaveSession`]: until an MLS group is negotiated (driver processes the external
-//! sender, key package, proposals, and commit/welcome via [`DaveEncryptor::session_mut`]),
-//! Opus frames pass through unchanged; once active, frames are end-to-end encrypted.
+//! DAVE end-to-end encryption for Opus frames, backed by the [`davey`] crate.
+//! Frames pass through unchanged until an MLS group is negotiated, then they are encrypted.
 
 use std::num::NonZeroU16;
 
@@ -27,41 +21,27 @@ pub struct DaveEncryptor {
 }
 
 impl DaveEncryptor {
-    /// Create a DAVE session for the given Discord user and channel using the latest supported
-    /// protocol version.
+    /// Create a DAVE session for a Discord user and channel at the latest protocol version.
     pub fn new(user_id: u64, channel_id: u64) -> Result<Self, davey::errors::InitError> {
         Ok(Self {
             session: DaveSession::new(PROTOCOL_VERSION, user_id, channel_id, None)?,
         })
     }
 
-    /// End-to-end encrypt one Opus frame.
-    ///
-    /// Returns:
-    /// - `Some(ciphertext)` once the MLS group is active (davey passes silence frames through
-    ///   unchanged itself);
-    /// - `Some(frame)` unchanged before any group exists — correct passthrough while DAVE is
-    ///   still negotiating or disabled;
-    /// - `None` if encryption fails **while the group is active**, signalling the caller to drop
-    ///   the frame. This is deliberate: emitting plaintext on the wire when peers expect DAVE
-    ///   ciphertext would be undecryptable for them and a privacy regression.
+    /// End-to-end encrypt one frame, or pass it through before a group exists. `None` means the
+    /// group is active but encryption failed, so the caller must drop the frame.
     pub fn encrypt(&mut self, packet: &[u8]) -> Option<Bytes> {
         match self.session.encrypt_opus(packet) {
-            // `encrypt_opus` yields a `Cow`: `Owned` once the group is active (the steady state),
-            // `Borrowed` during pre-group passthrough. `into_owned()` moves the owned ciphertext
-            // straight into `Bytes` with no copy, and only copies in the borrowed case.
+            // `Owned` once the group is active, `Borrowed` during passthrough, so `into_owned()`
+            // moves the ciphertext into `Bytes` without a copy in the steady state.
             Ok(encrypted) => Some(Bytes::from(encrypted.into_owned())),
             Err(_) if !self.session.is_ready() => Some(Bytes::copy_from_slice(packet)),
             Err(_) => None,
         }
     }
 
-    /// Reset and re-initialise the session for a new MLS group (Discord's new-epoch re-key, e.g.
-    /// after a member leaves/rejoins the voice channel).
-    ///
-    /// Tears down the old group, generates fresh credentials, and re-creates a pending group, so
-    /// the new group's proposals/welcome are accepted instead of being rejected with `Wrong Epoch`
-    /// / `AlreadyInGroup`. Reuses this session's own protocol version + user/channel ids.
+    /// Re-initialise the session for a new MLS group, Discord's new-epoch re-key.
+    /// Without it the new group's proposals fail with `Wrong Epoch` or `AlreadyInGroup`.
     pub fn reinit(&mut self) -> Result<(), davey::errors::ReinitError> {
         let version = self.session.protocol_version();
         let user_id = self.session.user_id();
@@ -75,9 +55,8 @@ impl DaveEncryptor {
         self.session.set_passthrough_mode(enabled, None);
     }
 
-    /// Tear down the current MLS group and clear key material, for a DAVE downgrade to protocol
-    /// v0. After this the session is INACTIVE and frames pass through unencrypted, as expected when
-    /// E2EE is disabled.
+    /// Tear down the MLS group and clear key material, for a downgrade to DAVE v0.
+    /// Afterwards the session is INACTIVE and frames pass through unencrypted.
     pub fn reset(&mut self) {
         if let Err(error) = self.session.reset() {
             tracing::warn!(%error, "DAVE: failed to reset session");
@@ -138,7 +117,6 @@ mod tests {
         assert_eq!(encryptor.status(), SessionStatus::INACTIVE);
     }
 
-    /// Pre-group frames must pass through byte-for-byte: DAVE is negotiated, not assumed.
     #[test]
     fn passes_frames_through_before_a_group_exists() {
         let mut encryptor = DaveEncryptor::new(1234, 5678).expect("create session");

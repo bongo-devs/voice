@@ -1,26 +1,5 @@
-//! A live Discord voice connection, orchestrating the gateway WebSocket, UDP transport, DAVE
-//! end-to-end encryption, and the 20 ms send loop.
-//!
-//! Lifecycle: connect the gateway (v8) → `IDENTIFY` → `HELLO`/heartbeat → `READY` (ssrc, udp
-//! endpoint, modes) → UDP IP discovery → `SELECT_PROTOCOL` → `SESSION_DESCRIPTION` (mode +
-//! secret key + dave protocol version) → spawn the send task ([`FramePacer`] → DAVE → transport
-//! → RTP → UDP) and the gateway supervisor (heartbeat, inbound dispatch, resume on disconnect).
-//!
-//! ## DAVE handling
-//! The full DAVE op set is driven here. Binary ops are dispatched to the [`davey`] session,
-//! after stripping the per-op wire framing that precedes the raw MLS bytes (see
-//! <https://daveprotocol.com/>): 25 `external_sender` → `set_external_sender` + send 26
-//! `key_package`; 27 `proposals` (payload `[operation_type: u8][proposals…]`) →
-//! `process_proposals` + send 28 `commit_welcome`; 29 `announce_commit_transition` (payload
-//! `[transition_id: u16][commit…]`) → `process_commit`; 30 `welcome` (payload
-//! `[transition_id: u16][welcome…]`) → `process_welcome`; on a bad commit/welcome we send the
-//! JSON op 31 `invalid_commit_welcome` (carrying that transition id) to be re-added. The JSON
-//! transition ops drive passthrough/epoch state: 21 `prepare_transition` (reply 23
-//! `transition_ready`, enter passthrough on a v0 downgrade), 22 `execute_transition`, 24
-//! `prepare_epoch`.
-//!
-//! [`davey`]: crate::dave::davey
-//! [`FramePacer`]: crate::pacer::FramePacer
+//! A live Discord voice connection: gateway v8 WebSocket, UDP transport, DAVE end-to-end
+//! encryption, and the 20 ms send loop.
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -58,31 +37,18 @@ use dave::*;
 use send_loop::*;
 use supervisor::*;
 
-/// WebSocket close codes on which Discord's voice gateway can be resumed (op 7). Other codes are
-/// treated as fatal — the higher layer should reconnect with fresh voice-server info.
-///
-/// In order: going away (1001), abnormal closure (1006), internal error (4000), unknown opcode
-/// (4001), failed to decode payload (4002), not authenticated (4003), already authenticated (4005),
-/// session timeout (4009), unknown protocol (4012), voice server crashed (4015), unknown encryption
-/// mode (4016), bad request (4020), and 4900, which this crate raises itself to force a reconnect.
-///
-/// 4009 in particular is what Discord sends after a heartbeat lapse — a routine network hiccup.
-/// Treating it as fatal leaves the guild permanently silent until the client happens to push a new
-/// voice update.
+/// Close codes the voice gateway can be resumed on (op 7); anything else is fatal. 4009 is a
+/// routine heartbeat lapse, and 4900 is raised by this crate to force a reconnect.
 const RESUMABLE_CLOSE_CODES: &[u16] = &[
     1001, 1006, 4000, 4001, 4002, 4003, 4005, 4009, 4012, 4015, 4016, 4020, 4900,
 ];
 
-/// Upper bound on the whole `IDENTIFY` → `SESSION_DESCRIPTION` exchange.
-///
-/// The caller awaits the handshake inline, so an unbounded wait means no audio for that guild *and*
-/// a task leaked with a live WebSocket plus UDP socket. Generous enough to cover a full 10 s
-/// IP-discovery retry cycle plus a slow voice region.
+/// Upper bound on the whole `IDENTIFY` to `SESSION_DESCRIPTION` exchange, awaited inline by the
+/// caller. Wide enough for a full IP-discovery retry cycle plus a slow voice region.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How many heartbeat intervals may pass with no op-6 ACK before the gateway is declared dead and
-/// resumed. Discord itself closes with 4009 after a heartbeat lapse, so this only fires when the
-/// socket is a zombie: it reads fine, but the gateway behind it is gone.
+/// Heartbeat intervals without an op-6 ACK before the gateway is declared dead and resumed. Only
+/// fires on a zombie socket: it reads fine, but the gateway behind it is gone.
 const MISSED_ACKS_BEFORE_DEAD: u32 = 3;
 
 /// How long the gateway supervisor is left alive after [`VoiceConnection::disconnect`] queues the
@@ -143,14 +109,14 @@ enum DaveEvent {
     ExecuteTransition { transition_id: u64 },
     /// Op 24 `DAVE_PREPARE_EPOCH`.
     PrepareEpoch { protocol_version: u16, epoch: u64 },
-    /// Op 11 `CLIENT_CONNECT` — users the gateway announced.
+    /// Op 11 `CLIENT_CONNECT`: users the gateway announced.
     UsersConnected { user_ids: Vec<u64> },
-    /// Op 13 `CLIENT_DISCONNECT` — a user left.
+    /// Op 13 `CLIENT_DISCONNECT`: a user left.
     UserDisconnected { user_id: u64 },
 }
 
-/// Everything needed to join a Discord voice channel — sourced from the main gateway's
-/// `VOICE_STATE_UPDATE` (session id) and `VOICE_SERVER_UPDATE` (token, endpoint) events.
+/// Everything needed to join a voice channel, sourced from the main gateway's `VOICE_STATE_UPDATE`
+/// and `VOICE_SERVER_UPDATE` events.
 #[derive(Debug, Clone)]
 pub struct VoiceServerInfo {
     /// Guild (server) id.
@@ -177,10 +143,8 @@ impl VoiceServerInfo {
     }
 }
 
-/// Re-announces our speaking state whenever a client connects (op 11/12), so clients that join
-/// *after* playback began receive our SSRC→user mapping and can render our audio. Without it, late
-/// joiners can hear nothing even though frames are flowing. The current speaking flag is kept in
-/// sync by the send task's pacer.
+/// Re-announces our speaking state on op 11/12 so clients that join after playback began get our
+/// SSRC-to-user mapping; without it late joiners hear nothing.
 #[derive(Clone)]
 struct SpeakingReannounce {
     ws_tx: mpsc::UnboundedSender<Message>,
@@ -224,9 +188,6 @@ pub struct VoiceConnection {
 
 impl VoiceConnection {
     /// Connect to a Discord voice server and start streaming frames from `provider`.
-    ///
-    /// Equivalent to [`connect_with_dispatcher`](Self::connect_with_dispatcher) with no
-    /// pre-registered event listeners.
     pub async fn connect<P>(info: VoiceServerInfo, provider: P) -> Result<Self, ConnectError>
     where
         P: OpusFrameProvider + 'static,
@@ -234,16 +195,8 @@ impl VoiceConnection {
         Self::connect_with_dispatcher(info, provider, EventDispatcher::new()).await
     }
 
-    /// Connect to a Discord voice server, dispatching lifecycle [`VoiceEvent`]s to the listeners
-    /// pre-registered on `dispatcher`.
-    ///
-    /// Register listeners *before* calling this: early events ([`GatewayReady`],
-    /// [`ExternalIpDiscovered`], [`SessionDescription`]) fire during the handshake, so a listener
-    /// added afterwards via [`add_listener`](Self::add_listener) would miss them.
-    ///
-    /// [`GatewayReady`]: VoiceEvent::GatewayReady
-    /// [`ExternalIpDiscovered`]: VoiceEvent::ExternalIpDiscovered
-    /// [`SessionDescription`]: VoiceEvent::SessionDescription
+    /// Connect, dispatching lifecycle [`VoiceEvent`]s to the listeners already on `dispatcher`.
+    /// Register them first: the handshake events fire before this returns.
     pub async fn connect_with_dispatcher<P>(
         info: VoiceServerInfo,
         provider: P,
@@ -265,10 +218,8 @@ impl VoiceConnection {
         let mut heartbeat_interval = 41_250.0f64;
         let mut last_seq = 0u64;
 
-        // Created before the handshake so DAVE ops that arrive *during* it are queued rather than
-        // dropped: Discord can send op 25 `external_sender` (and the 21/24 transition ops) before
-        // `SESSION_DESCRIPTION`, and losing op 25 is unrecoverable — every later welcome then fails
-        // with `NoExternalSender`, so the group never activates and every frame is dropped.
+        // Created before the handshake so DAVE ops arriving during it queue instead of being lost:
+        // op 25 can precede `SESSION_DESCRIPTION`, and losing it is unrecoverable.
         let (dave_tx, dave_rx) = mpsc::unbounded_channel::<DaveEvent>();
 
         // Drive the handshake until SESSION_DESCRIPTION, yielding the secret key + dave version.
@@ -295,10 +246,8 @@ impl VoiceConnection {
                         forward_dave_binary(&b, &dave_tx);
                         continue;
                     }
-                    // A close *during* the handshake carries the diagnosis the caller needs —
-                    // 4006 (stale session id), 4009 (session timeout), 4014 (disconnected),
-                    // 4004 (auth failed). Dispatch it so it reaches the client instead of being
-                    // flattened into an opaque failure.
+                    // A close here carries the diagnosis the caller needs (4006 stale session, 4009
+                    // timeout, 4014 disconnected, 4004 auth failed), so dispatch it too.
                     Message::Close(frame) => {
                         let (code, reason) = frame
                             .map(|f| (u16::from(f.code), f.reason.to_string()))
@@ -418,9 +367,8 @@ impl VoiceConnection {
 
         let (ws_tx, ws_rx) = mpsc::unbounded_channel::<Message>();
 
-        // DAVE enabled: send our MLS key package up front, so the gateway has it before it issues
-        // the add proposals/commit that put us in the group. Queued on the outbound channel, it
-        // flushes as soon as the gateway task starts pumping.
+        // Queue our MLS key package up front, so the gateway has it before it issues the add
+        // proposals that put us in the group.
         if dave_version > 0 {
             send_key_package(&mut dave, &ws_tx);
         }
@@ -430,10 +378,8 @@ impl VoiceConnection {
         // re-announce speaking when a client connects.
         let speaking = Arc::new(AtomicBool::new(false));
 
-        // Publish `Connected` *before* the tasks exist: a gateway close that lands immediately
-        // stores `Closed` from the supervisor, and storing `Connected` afterwards would overwrite
-        // it — leaving `send_loop` pacing frames at 50 fps into a dead socket forever (its only
-        // exit is observing `Closed`) and `is_connected` reporting a live connection.
+        // Store `Connected` before the tasks exist: an immediate close stores `Closed` from the
+        // supervisor, and storing `Connected` after that would overwrite it and never exit.
         state.store(ConnectionState::Connected as u8, Ordering::SeqCst);
         tracing::info!(ssrc, "voice: connected, audio send loop running");
 
@@ -512,10 +458,8 @@ impl VoiceConnection {
         &self.dispatcher
     }
 
-    /// Register a listener for ongoing [`VoiceEvent`]s. Listeners added here will *not* receive
-    /// handshake events already emitted before [`connect`](Self::connect) returned — pass a
-    /// pre-populated dispatcher to [`connect_with_dispatcher`](Self::connect_with_dispatcher) to
-    /// catch those.
+    /// Register a listener for ongoing [`VoiceEvent`]s. Handshake events already emitted before
+    /// [`connect`](Self::connect) returned are not replayed.
     pub fn add_listener(&self, listener: Arc<dyn VoiceEventListener>) {
         self.dispatcher.register(listener);
     }
@@ -533,7 +477,7 @@ impl VoiceConnection {
         self.state
             .store(ConnectionState::Closed as u8, Ordering::SeqCst);
         let _ = self.ws_tx.send(close_message());
-        // Stop the audio immediately — the caller may already be handing this guild's frames to a
+        // Stop the audio immediately: the caller may already be feeding this guild's frames to a
         // replacement connection, and two send tasks on one SSRC interleave RTP sequence numbers.
         if let Some(sender) = self.sender.take() {
             sender.abort();
@@ -711,12 +655,9 @@ mod tests {
 
     #[test]
     fn dave_ops_are_routed_to_the_send_task() {
-        // The handshake and the supervisor share this routing: DAVE ops that land before
-        // SESSION_DESCRIPTION must reach the send task, or a dropped op 25 leaves every later
-        // welcome failing with `NoExternalSender` and the group never activates.
         let (tx, mut rx) = mpsc::unbounded_channel::<DaveEvent>();
 
-        // `[seq: u16 BE][op][mls…]` — the seq and op bytes are stripped, the MLS bytes are not.
+        // `[seq: u16 BE][op][mls…]`: the seq and op bytes are stripped, the MLS bytes are not.
         forward_dave_binary(&[0x00, 0x07, OP_DAVE_MLS_EXTERNAL_SENDER, 0xAB], &tx);
         forward_dave_binary(&[0x00, 0x08, 99, 0xCD], &tx); // not a DAVE op
         forward_dave_binary(&[0x00], &tx); // too short to carry an op
@@ -770,8 +711,8 @@ mod tests {
 
     #[test]
     fn resume_backoff_grows_and_stays_bounded() {
-        // Every connection on a host drops together when a voice server cycles, so the delay must
-        // grow and carry jitter — but stay inside the gateway's own session-resume window.
+        // Voice servers cycle whole hosts at once, so the delay must grow and carry jitter while
+        // staying inside the gateway's session-resume window.
         let delays: Vec<Duration> = (0..5).map(backoff_delay).collect();
         for pair in delays.windows(2) {
             assert!(pair[1] > pair[0], "{:?} must grow", delays);

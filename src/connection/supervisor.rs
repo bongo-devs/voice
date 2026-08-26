@@ -49,9 +49,8 @@ pub(super) async fn gateway_loop(
                 reason,
                 by_remote,
             } => {
-                // We asked for this close: `disconnect` (and the send loop giving up) store `Closed`
-                // before the close frame goes out. Neither resume it nor report it as a gateway
-                // failure — a local stop is not a gateway close.
+                // `disconnect` and the send loop giving up both store `Closed` before the close
+                // frame goes out, so a local stop is neither resumed nor reported.
                 if ConnectionState::from_u8(state.load(Ordering::SeqCst)) == ConnectionState::Closed
                 {
                     tracing::debug!(code = code.unwrap_or(0), "voice: gateway closed locally");
@@ -64,10 +63,8 @@ pub(super) async fn gateway_loop(
                         "voice: gateway dropped, attempting resume"
                     );
                     state.store(ConnectionState::Reconnecting as u8, Ordering::SeqCst);
-                    // Best-effort resume: reconnect and send op 7 with the last seen sequence.
-                    // Exponential backoff with jitter — every connection on a host drops together
-                    // when Discord cycles a voice server, and a fixed schedule would have them all
-                    // reconnect in lockstep.
+                    // Backoff is jittered because Discord cycling a voice server drops every
+                    // connection on the host at once, and a fixed schedule reconnects them in step.
                     for attempt in 0..5u32 {
                         sleep(backoff_delay(attempt)).await;
                         if let Ok((new_sink, new_stream)) = reconnect(&resume.url).await {
@@ -112,10 +109,7 @@ pub(super) fn is_resumable(code: Option<u16>) -> bool {
     }
 }
 
-/// Resume backoff: `500 ms * 2^attempt` capped at 8 s, plus up to 500 ms of jitter.
-///
-/// The jitter comes from the wall clock's sub-millisecond digits rather than pulling in `rand` — a
-/// reconnect delay does not need a real PRNG, only de-synchronised connections.
+/// Resume backoff: `500 ms * 2^attempt` capped at 8 s, plus up to 500 ms of clock-derived jitter.
 pub(super) fn backoff_delay(attempt: u32) -> Duration {
     let base = Duration::from_millis(500 << attempt.min(4));
     let jitter = std::time::SystemTime::now()
@@ -127,11 +121,9 @@ pub(super) fn backoff_delay(attempt: u32) -> Duration {
 
 /// Outcome of one [`pump`] over a single WebSocket lifetime.
 enum PumpOutcome {
-    /// The outbound channel closed (the connection was disconnected/dropped) — stop entirely.
+    /// The outbound channel closed (the connection was disconnected or dropped), so stop entirely.
     Stop,
-    /// The WebSocket closed or errored. `code` is the close code if the peer sent a close frame
-    /// (`None` for an abnormal drop or local I/O failure); the supervisor decides
-    /// resume-vs-fatal from it via [`is_resumable`].
+    /// The WebSocket closed or errored. [`is_resumable`] decides resume-vs-fatal from `code`.
     Closed {
         /// The close code, if a close frame was received.
         code: Option<u16>,
@@ -159,9 +151,8 @@ async fn pump(
 ) -> PumpOutcome {
     // When the last heartbeat was sent, used to compute the round-trip on the matching ACK (op 6).
     let mut last_heartbeat: Option<Instant> = None;
-    // When we last saw an op 6. A voice gateway that stops acking is dead even though the TCP
-    // connection reads fine; without this watchdog a zombie session silently swallows every frame
-    // and nothing ever reconnects.
+    // A gateway that stops acking is dead even though its TCP connection still reads fine, so this
+    // watchdog is what stops a zombie session swallowing every frame forever.
     let mut last_ack = Instant::now();
     let ack_timeout = hb.period() * MISSED_ACKS_BEFORE_DEAD;
     loop {
@@ -300,8 +291,8 @@ fn handle_inbound(
                         ping.store(sent.elapsed().as_millis() as u64, Ordering::Relaxed);
                     }
                 }
-                // Op 9 `RESUMED`: the gateway accepted our op 7, so the session really is live again
-                // (the supervisor stores `Connected` optimistically when the resume is *sent*).
+                // Op 9 `RESUMED`: the gateway accepted our op 7, so the session is live again (the
+                // supervisor stores `Connected` optimistically when the resume is sent).
                 9 => {
                     tracing::info!("voice: gateway session resumed (RESUMED)");
                     state.store(ConnectionState::Connected as u8, Ordering::SeqCst);
@@ -347,13 +338,8 @@ fn handle_inbound(
     }
 }
 
-/// Forward a server→client binary MLS op to the send task, which owns the DAVE session. Frame layout
-/// is `[seq: u16 BE][op: u8][mls…]`.
-///
-/// Shared with the handshake in [`VoiceConnection::connect_with_dispatcher`]: Discord can start the
-/// DAVE handshake before `SESSION_DESCRIPTION`, and dropping op 25 in that window is unrecoverable
-/// (every later welcome then fails with `NoExternalSender`, and `reinit` cannot conjure one). The
-/// receiver is unbounded, so ops that arrive before the send task exists simply queue.
+/// Forward a binary MLS op (`[seq: u16 BE][op: u8][mls…]`) to the send task, which owns the DAVE
+/// session. Also called during the handshake, since op 25 can precede `SESSION_DESCRIPTION`.
 pub(super) fn forward_dave_binary(bytes: &[u8], dave_tx: &mpsc::UnboundedSender<DaveEvent>) {
     if bytes.len() < 3 {
         return;
