@@ -68,16 +68,14 @@ pub(super) fn speaking_message(speaking: bool, ssrc: u32) -> Message {
     )
 }
 
-/// Op 15 `MEDIA_SINK_WANTS` with `any: 0`, the payload for a connection that wants no inbound
-/// media. There is no receive path here, so telling the SFU to stop forwarding other members' media
-/// keeps Discord from streaming audio to the node that we would only drop.
+/// Op 15 `MEDIA_SINK_WANTS` with `any: 0`. There is no receive path here, so stop the SFU
+/// forwarding other members' media that we would only drop.
 pub(super) fn media_sink_wants_message() -> Message {
     Message::text(json!({ "op": 15, "d": { "any": 0 } }).to_string())
 }
 
-/// A normal (1000) close frame, sent on `disconnect`.
-/// Closing with a code lets Discord retire the voice session immediately instead of waiting for it
-/// to time out, which is what makes an instant rejoin work.
+/// A normal (1000) close frame, sent on `disconnect`. The code retires the voice session
+/// immediately instead of waiting for it to time out, which is what makes an instant rejoin work.
 pub(super) fn close_message() -> Message {
     Message::Close(Some(CloseFrame {
         code: CloseCode::Normal,
