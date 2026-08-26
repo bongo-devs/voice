@@ -41,12 +41,8 @@ impl VoiceUdp {
         Ok(Self { socket })
     }
 
-    /// Perform Discord IP discovery: send a 74-byte request and parse the reply for our public
-    /// address. See <https://discord.com/developers/docs/topics/voice-connections#ip-discovery>.
-    ///
-    /// The request is resent once a second for up to `DISCOVERY_ATTEMPTS` tries, and any datagram
-    /// that isn't exactly 74 bytes long is ignored rather than treated as a failure. Without this a
-    /// single dropped UDP packet would wedge the whole voice handshake forever.
+    /// Send the 74-byte discovery request and parse our public address out of the reply.
+    /// See <https://discord.com/developers/docs/topics/voice-connections#ip-discovery>.
     pub async fn discover_ip(&self, ssrc: u32) -> io::Result<DiscoveredAddress> {
         let mut request = [0u8; 74];
         request[0..2].copy_from_slice(&1u16.to_be_bytes()); // type = request
@@ -57,6 +53,7 @@ impl VoiceUdp {
         // silently truncated to a plausible-looking response.
         let mut response = [0u8; 128];
 
+        // One dropped packet must not wedge the handshake, so resend and keep reading.
         for attempt in 1..=DISCOVERY_ATTEMPTS {
             self.socket.send(&request).await?;
             let deadline = Instant::now() + DISCOVERY_INTERVAL;
@@ -79,17 +76,8 @@ impl VoiceUdp {
             "failed to discover external UDP address",
         ))
     }
-
-    /// Send one packet to the connected voice server.
-    pub async fn send(&self, packet: &[u8]) -> io::Result<()> {
-        self.socket.send(packet).await.map(|_| ())
-    }
 }
 
-/// Lets a [`VoiceUdp`] be used directly as a [`FrameSink`], so the [`FramePacer`] can write
-/// finished packets straight to the connected voice socket.
-///
-/// [`FramePacer`]: crate::pacer::FramePacer
 impl FrameSink for VoiceUdp {
     async fn send(&mut self, packet: &[u8]) -> io::Result<()> {
         self.socket.send(packet).await.map(|_| ())
@@ -128,7 +116,6 @@ mod tests {
         assert_eq!(parsed.port, 50000);
     }
 
-    /// A stray non-74-byte datagram must be skipped rather than aborting discovery.
     #[tokio::test]
     async fn discovery_ignores_wrong_sized_packets() {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -140,7 +127,6 @@ mod tests {
             assert_eq!(n, 74);
             assert_eq!(u32::from_be_bytes(buf[4..8].try_into().unwrap()), 4242);
 
-            // Junk first, then the real reply.
             server.send_to(&[0u8; 8], from).await.unwrap();
 
             let mut response = [0u8; 74];
