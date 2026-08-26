@@ -60,7 +60,7 @@ listeners added later miss the events that fire during it.
 | `provider`   | The producer/consumer contract for Opus frames                     |
 | `dave`       | DAVE end-to-end encryption, backed by `davey`                      |
 | `transport`  | The transport AEAD ciphers                                         |
-| `rtp`        | RTP header and packet assembly                                     |
+| `rtp`        | The RTP header                                                     |
 | `udp`        | The UDP socket and IP discovery                                    |
 | `sink`       | Where finished packets go (UDP, or in-memory for tests)            |
 | `event`      | Connection events and listener dispatch                            |
