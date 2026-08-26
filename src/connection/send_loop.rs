@@ -2,8 +2,7 @@ use super::builders::speaking_message;
 use super::dave::handle_dave_event;
 use super::*;
 
-/// The 20 ms send task: paces audio frames through the [`FramePacer`] (DAVE → transport → RTP →
-/// UDP) and applies DAVE MLS messages between ticks.
+/// The 20 ms send task, pacing frames through the [`FramePacer`] and applying DAVE MLS messages.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn send_loop<P>(
     provider: P,
@@ -35,22 +34,17 @@ pub(super) async fn send_loop<P>(
     let mut dave_open = true;
     let mut was_ready = pacer.dave_mut().is_ready();
 
-    // Absolute per-slot deadlines, so a late tick is caught up instead of letting the lateness
-    // accumulate.
+    // Absolute per-slot deadlines, so a late tick is caught up instead of accumulating.
     let mut clock = FrameClock::new();
 
-    // A few transient UDP send failures shouldn't tear down the connection; drop the frame and keep
-    // going. Only give up after sustained failure (~1 s) so a genuinely dead socket still lets the
-    // gateway drive a reconnect, rather than spinning forever.
+    // Transient UDP failures shouldn't tear down the connection, so drop the frame and keep going.
+    // Give up after ~1 s of it, so a genuinely dead socket still lets the gateway reconnect.
     let mut consecutive_send_errors: u32 = 0;
     const MAX_CONSECUTIVE_SEND_ERRORS: u32 = 50;
 
     loop {
-        // Stop once the gateway supervisor declares the connection dead (a fatal, non-resumable
-        // close). UDP sends don't error on a dead session, so without this the pacer would keep
-        // ticking and blindly sending RTP forever, leaking a 50 fps task until the connection is
-        // dropped. (`disconnect`/`Drop` abort the task directly; this covers the gateway-fatal path
-        // where neither runs.)
+        // UDP sends keep succeeding after a fatal gateway close, so without this the pacer would
+        // tick and send RTP forever, leaking a 50 fps task.
         if ConnectionState::from_u8(state.load(Ordering::SeqCst)) == ConnectionState::Closed {
             break;
         }
@@ -69,11 +63,8 @@ pub(super) async fn send_loop<P>(
                             tracing::warn!(
                                 "voice: too many consecutive send failures, stopping send loop"
                             );
-                            // The socket is gone for good, so this connection is dead even though
-                            // the gateway WebSocket still reads fine. Mark it closed so the caller
-                            // can rebuild it, report 4900 so the close is visible, and close the
-                            // gateway so the supervisor task stops too. Storing `Closed` first is
-                            // what keeps the supervisor from resuming or double-reporting.
+                            // Mark closed before reporting, so the supervisor neither resumes nor
+                            // double-reports, then close the gateway so its task stops too.
                             state.store(ConnectionState::Closed as u8, Ordering::SeqCst);
                             dispatcher.dispatch(VoiceEvent::GatewayClosed {
                                 code: 4900,
@@ -96,8 +87,8 @@ pub(super) async fn send_loop<P>(
                             event,
                             &ws_tx,
                         );
-                        // The MLS group flipping to active means end-to-end encryption is now in
-                        // effect — announce it once, with the human-verifiable privacy code.
+                        // The group flipping to active means end-to-end encryption is on, so
+                        // announce it once with the privacy code.
                         let ready = pacer.dave_mut().is_ready();
                         if ready && !was_ready {
                             let privacy_code =
