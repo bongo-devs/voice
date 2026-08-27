@@ -8,7 +8,7 @@ use tokio::time::{sleep_until, Instant};
 use crate::dave::DaveEncryptor;
 use crate::frame::{FRAME_DURATION, OPUS_SILENCE_FRAME, SAMPLES_PER_FRAME, SILENCE_FRAME_COUNT};
 use crate::provider::OpusFrameProvider;
-use crate::rtp::RtpHeader;
+use crate::rtp::{RtpHeader, RTP_HEADER_LEN};
 use crate::sink::FrameSink;
 use crate::transport::{PlainTransport, TransportCipher};
 
@@ -148,9 +148,9 @@ impl<P: OpusFrameProvider, S: FrameSink> FramePacer<P, S> {
         if let Some(frame) = self.provider.provide() {
             self.set_speaking(true);
             self.silence_left = SILENCE_FRAME_COUNT;
-            // `None` => active-group encryption failed; drop the frame rather than leak plaintext.
-            if let Some(payload) = self.dave.encrypt(&frame) {
-                self.send(&payload).await?;
+            // `false` => active-group encryption failed; drop the frame rather than leak plaintext.
+            if self.build_packet(&frame) {
+                self.send().await?;
             }
             Ok(PacerStatus::Sent)
         } else if self.silence_left > 0 {
@@ -158,8 +158,8 @@ impl<P: OpusFrameProvider, S: FrameSink> FramePacer<P, S> {
             // `set_speaking` makes this fire once.
             self.set_speaking(false);
             self.silence_left -= 1;
-            if let Some(payload) = self.dave.encrypt(&OPUS_SILENCE_FRAME) {
-                self.send(&payload).await?;
+            if self.build_packet(&OPUS_SILENCE_FRAME) {
+                self.send().await?;
             }
             Ok(PacerStatus::Silence)
         } else {
@@ -178,20 +178,24 @@ impl<P: OpusFrameProvider, S: FrameSink> FramePacer<P, S> {
         }
     }
 
-    /// RTP-frame, transport-encrypt, and send one already-DAVE-processed payload.
-    /// Assembled in place in `self.packet`, so a steady-state frame costs zero allocations.
-    async fn send(&mut self, payload: &[u8]) -> io::Result<()> {
-        let header_bytes = self.header.to_bytes();
-
+    /// Write the RTP header and the DAVE-processed frame into the reused packet buffer.
+    /// `false` => active-group encryption failed and the frame must be dropped.
+    fn build_packet(&mut self, frame: &[u8]) -> bool {
         self.packet.clear();
-        self.packet.extend_from_slice(&header_bytes);
-        self.packet.extend_from_slice(payload);
+        self.packet.extend_from_slice(&self.header.to_bytes());
+        // Disjoint field borrows: DAVE appends straight into the packet, so the payload is never
+        // materialised as its own buffer.
+        self.dave.encrypt_into(frame, &mut self.packet)
+    }
 
+    /// Transport-encrypt and send the packet built by [`build_packet`](Self::build_packet).
+    /// Encrypted in place, so a steady-state frame costs zero allocations.
+    async fn send(&mut self) -> io::Result<()> {
         // Drop the frame on an AEAD failure: sending the plaintext would leak audio, and this runs
         // on a shared runtime worker where a panic would take unrelated connections down with it.
         if let Err(cause) = self
             .transport
-            .encrypt_in_place(&mut self.packet, header_bytes.len())
+            .encrypt_in_place(&mut self.packet, RTP_HEADER_LEN)
         {
             tracing::warn!(cause, "voice: transport encryption failed, dropping frame");
         } else {

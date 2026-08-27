@@ -3,7 +3,6 @@
 
 use std::num::NonZeroU16;
 
-use bytes::Bytes;
 use davey::{DaveSession, SessionStatus};
 
 /// Re-export of davey so consumers can drive the MLS handshake with matching types.
@@ -28,15 +27,24 @@ impl DaveEncryptor {
         })
     }
 
-    /// End-to-end encrypt one frame, or pass it through before a group exists. `None` means the
-    /// group is active but encryption failed, so the caller must drop the frame.
-    pub fn encrypt(&mut self, packet: &[u8]) -> Option<Bytes> {
+    /// End-to-end encrypt one frame into `out`, or pass it through unchanged before a group exists.
+    /// `false` means the group is active but encryption failed, so the caller must drop the frame.
+    ///
+    /// Appends rather than returning a buffer: `encrypt_opus` borrows the input during passthrough
+    /// (the common case, and every frame of a non-DAVE connection), so handing back an owned buffer
+    /// meant an allocation and a copy per frame — 50/s per player — that the caller then copied a
+    /// second time into its RTP packet. Writing straight into that packet leaves one copy.
+    pub fn encrypt_into(&mut self, packet: &[u8], out: &mut Vec<u8>) -> bool {
         match self.session.encrypt_opus(packet) {
-            // `Owned` once the group is active, `Borrowed` during passthrough, so `into_owned()`
-            // moves the ciphertext into `Bytes` without a copy in the steady state.
-            Ok(encrypted) => Some(Bytes::from(encrypted.into_owned())),
-            Err(_) if !self.session.is_ready() => Some(Bytes::copy_from_slice(packet)),
-            Err(_) => None,
+            Ok(encrypted) => {
+                out.extend_from_slice(&encrypted);
+                true
+            }
+            Err(_) if !self.session.is_ready() => {
+                out.extend_from_slice(packet);
+                true
+            }
+            Err(_) => false,
         }
     }
 
@@ -121,6 +129,9 @@ mod tests {
     fn passes_frames_through_before_a_group_exists() {
         let mut encryptor = DaveEncryptor::new(1234, 5678).expect("create session");
         let frame = b"opus-frame-bytes";
-        assert_eq!(encryptor.encrypt(frame).expect("passthrough"), &frame[..]);
+        // Appends to whatever the caller already wrote (the RTP header, in the pacer).
+        let mut out = b"header".to_vec();
+        assert!(encryptor.encrypt_into(frame, &mut out));
+        assert_eq!(out, [&b"header"[..], &frame[..]].concat());
     }
 }

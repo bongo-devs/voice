@@ -11,9 +11,11 @@ fn dave_encryptor_passes_through_until_group_active() {
     assert!(!enc.is_ready());
 
     let frame = b"an-opus-frame";
-    let out = enc
-        .encrypt(frame)
-        .expect("passthrough before group is active");
+    let mut out = Vec::new();
+    assert!(
+        enc.encrypt_into(frame, &mut out),
+        "passthrough before group is active"
+    );
     assert_eq!(&out[..], frame);
 }
 
