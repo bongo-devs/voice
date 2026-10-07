@@ -28,6 +28,22 @@ impl RtpHeader {
         }
     }
 
+    /// Advance the sample clock by one 20 ms frame. Called once per frame slot that produced
+    /// audio, whether or not the packet actually went out: the timeline is wall-clock, so a
+    /// dropped frame still consumes its 960 samples.
+    pub fn advance_timestamp(&mut self, samples_per_frame: u32) {
+        self.timestamp = self.timestamp.wrapping_add(samples_per_frame);
+    }
+
+    /// Consume the next sequence number. Called only for a packet that reaches the socket —
+    /// sequence numbers count packets sent, so a dropped frame must not burn one or the receiver
+    /// sees a phantom loss.
+    pub fn next_sequence(&mut self) -> u16 {
+        let sequence = self.sequence;
+        self.sequence = self.sequence.wrapping_add(1);
+        sequence
+    }
+
     /// The 12 header bytes.
     pub fn to_bytes(&self) -> [u8; RTP_HEADER_LEN] {
         let mut buf = [0u8; RTP_HEADER_LEN];

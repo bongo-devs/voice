@@ -151,6 +151,9 @@ impl<P: OpusFrameProvider, S: FrameSink> FramePacer<P, S> {
             // `false` => active-group encryption failed; drop the frame rather than leak plaintext.
             if self.build_packet(&frame) {
                 self.send().await?;
+            } else {
+                // Dropped frames still occupy their 20 ms slot: keep the RTP clock on wall time.
+                self.header.advance_timestamp(SAMPLES_PER_FRAME);
             }
             Ok(PacerStatus::Sent)
         } else if self.silence_left > 0 {
@@ -160,6 +163,9 @@ impl<P: OpusFrameProvider, S: FrameSink> FramePacer<P, S> {
             self.silence_left -= 1;
             if self.build_packet(&OPUS_SILENCE_FRAME) {
                 self.send().await?;
+            } else {
+                // Dropped frames still occupy their 20 ms slot: keep the RTP clock on wall time.
+                self.header.advance_timestamp(SAMPLES_PER_FRAME);
             }
             Ok(PacerStatus::Silence)
         } else {
