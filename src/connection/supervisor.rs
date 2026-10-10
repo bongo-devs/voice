@@ -58,14 +58,37 @@ pub(super) async fn gateway_loop(
                 }
                 let mut recovered = false;
                 if is_resumable(code) {
+                    // Only resume if still Connected; a concurrent `disconnect` sets Closed, and
+                    // resuming would revive a connection the caller asked to drop.
+                    let claimed = state
+                        .compare_exchange(
+                            ConnectionState::Connected as u8,
+                            ConnectionState::Reconnecting as u8,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        )
+                        .is_ok();
+                    if !claimed {
+                        // `disconnect` raced in after the drop; flush its queued close and stop.
+                        let _ = sink.send(Message::Close(None)).await;
+                        return;
+                    }
                     tracing::warn!(
                         code = code.unwrap_or(0),
                         "voice: gateway dropped, attempting resume"
                     );
-                    state.store(ConnectionState::Reconnecting as u8, Ordering::SeqCst);
                     // Backoff is jittered because Discord cycling a voice server drops every
                     // connection on the host at once, and a fixed schedule reconnects them in step.
                     for attempt in 0..5u32 {
+                        // Nothing pumps `ws_rx` during this loop, so a `disconnect` queued there is
+                        // invisible; watch the state and flush the close frame ourselves instead of
+                        // leaking the session until Discord times it out.
+                        if ConnectionState::from_u8(state.load(Ordering::SeqCst))
+                            == ConnectionState::Closed
+                        {
+                            let _ = sink.send(Message::Close(None)).await;
+                            return;
+                        }
                         sleep(backoff_delay(attempt)).await;
                         if let Ok((new_sink, new_stream)) = reconnect(&resume.url).await {
                             sink = new_sink;
@@ -403,6 +426,9 @@ pub(super) fn forward_dave_json(op: u64, d: &Value, dave_tx: &mpsc::UnboundedSen
 }
 
 pub(super) async fn reconnect(url: &str) -> Result<(WsSink, WsSource), ConnectError> {
-    let (ws, _response) = connect_async(url).await?;
+    let (ws, _response) = match timeout(HANDSHAKE_TIMEOUT, connect_async(url)).await {
+        Ok(result) => result?,
+        Err(_) => return Err("voice gateway reconnect timed out".into()),
+    };
     Ok(ws.split())
 }

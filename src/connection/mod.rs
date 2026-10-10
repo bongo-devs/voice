@@ -207,7 +207,10 @@ impl VoiceConnection {
     {
         let state = Arc::new(AtomicU8::new(ConnectionState::Connecting as u8));
         let url = info.ws_url();
-        let (ws, _response) = connect_async(url.as_str()).await?;
+        let (ws, _response) = match timeout(HANDSHAKE_TIMEOUT, connect_async(url.as_str())).await {
+            Ok(result) => result?,
+            Err(_) => return Err("voice gateway connect timed out".into()),
+        };
         let (mut sink, mut stream) = ws.split();
 
         sink.send(Message::text(identify_message(&info))).await?;
@@ -363,14 +366,23 @@ impl VoiceConnection {
             dave_protocol_version: dave_version,
         });
         let transport = cipher_for_mode(mode, &secret_key).map_err(ConnectError::from)?;
-        let mut dave = DaveEncryptor::new(info.user_id, info.channel_id)?;
+        // MLS keygen (Ed25519 + HPKE) is CPU-bound; keep it off the async worker.
+        let user_id = info.user_id;
+        let channel_id = info.channel_id;
+        let mut dave =
+            tokio::task::spawn_blocking(move || DaveEncryptor::new(user_id, channel_id)).await??;
 
         let (ws_tx, ws_rx) = mpsc::unbounded_channel::<Message>();
 
         // Queue our MLS key package up front, so the gateway has it before it issues the add
         // proposals that put us in the group.
         if dave_version > 0 {
-            send_key_package(&mut dave, &ws_tx);
+            let ws_tx_kp = ws_tx.clone();
+            dave = tokio::task::spawn_blocking(move || {
+                send_key_package(&mut dave, &ws_tx_kp);
+                dave
+            })
+            .await?;
         }
         // Send-only connection: ask the SFU for no inbound media at all.
         let _ = ws_tx.send(media_sink_wants_message());
