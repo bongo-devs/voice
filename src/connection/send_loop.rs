@@ -1,4 +1,4 @@
-use super::builders::speaking_message;
+use super::builders::{should_send_speaking, speaking_message};
 use super::dave::handle_dave_event;
 use super::*;
 
@@ -23,7 +23,9 @@ pub(super) async fn send_loop<P>(
     pacer.on_speaking(move |speaking| {
         // Keep the shared flag in sync so the gateway task can re-announce it on op 11/12.
         speaking_flag.store(speaking, Ordering::Relaxed);
-        let _ = speaking_tx.send(speaking_message(speaking, ssrc));
+        if should_send_speaking(speaking) {
+            let _ = speaking_tx.send(speaking_message(speaking, ssrc));
+        }
     });
 
     // Pending protocol-version transitions, keyed by transition id (set on prepare, applied on

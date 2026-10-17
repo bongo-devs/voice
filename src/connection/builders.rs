@@ -68,6 +68,12 @@ pub(super) fn speaking_message(speaking: bool, ssrc: u32) -> Message {
     )
 }
 
+// only announce starts: Discord infers the stop from RTP, and an explicit stop (mask 0) makes
+// the gateway churn begin/end speaking, which some clients render as a click
+pub(super) fn should_send_speaking(speaking: bool) -> bool {
+    speaking
+}
+
 /// Op 15 `MEDIA_SINK_WANTS` with `any: 0`. There is no receive path here, so stop the SFU
 /// forwarding other members' media that we would only drop.
 pub(super) fn media_sink_wants_message() -> Message {
@@ -81,4 +87,15 @@ pub(super) fn close_message() -> Message {
         code: CloseCode::Normal,
         reason: Default::default(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_speaking_start_is_announced() {
+        assert!(should_send_speaking(true));
+        assert!(!should_send_speaking(false), "no explicit op-5 stop");
+    }
 }
