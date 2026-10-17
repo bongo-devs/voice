@@ -164,11 +164,12 @@ impl<P: OpusFrameProvider, S: FrameSink> FramePacer<P, S> {
         }
 
         if let Some(frame) = self.provider.provide() {
-            self.set_speaking(true);
             self.silence_left = SILENCE_FRAME_COUNT;
             // `false` => active-group encryption failed; drop the frame rather than leak plaintext.
             if self.build_packet(&frame) {
                 self.send().await?;
+                // announce only once the frame is actually on the wire
+                self.set_speaking(true);
             } else {
                 // Dropped frames still occupy their 20 ms slot: keep the RTP clock on wall time.
                 self.header.advance_timestamp(SAMPLES_PER_FRAME);

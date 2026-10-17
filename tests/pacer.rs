@@ -1,13 +1,23 @@
 //! Tests the 20 ms pacer: RTP framing, silence draining, and sequence/timestamp progression.
 
+use std::io;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use voice::rtp::RTP_HEADER_LEN;
 use voice::{
-    DaveEncryptor, FramePacer, PacerStatus, VecSink, OPUS_SILENCE_FRAME, SAMPLES_PER_FRAME,
-    SILENCE_FRAME_COUNT,
+    DaveEncryptor, FramePacer, FrameSink, PacerStatus, VecSink, OPUS_SILENCE_FRAME,
+    SAMPLES_PER_FRAME, SILENCE_FRAME_COUNT,
 };
+
+// a sink that always fails, to exercise the send-error path
+struct FailingSink;
+
+impl FrameSink for FailingSink {
+    async fn send(&mut self, _packet: &[u8]) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Other, "send failed"))
+    }
+}
 
 #[tokio::test]
 async fn paces_audio_then_silence_then_idle() {
@@ -84,4 +94,22 @@ async fn frames_are_kept_until_the_key_ratchet_is_ready() {
     for packet in sink.packets() {
         assert_eq!(&packet[RTP_HEADER_LEN..], &OPUS_SILENCE_FRAME[..]);
     }
+}
+
+#[tokio::test]
+async fn a_failed_send_does_not_announce_speaking() {
+    let mut frames = vec![Bytes::from_static(b"audio")];
+    let provider = move || frames.pop();
+    let dave = DaveEncryptor::new(1, 2).expect("create DAVE session");
+    let mut pacer = FramePacer::new(provider, FailingSink, dave, 0x1234);
+
+    let announced = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&announced);
+    pacer.on_speaking(move |speaking| seen.lock().unwrap().push(speaking));
+
+    assert!(pacer.tick().await.is_err());
+    assert!(
+        announced.lock().unwrap().is_empty(),
+        "a frame that never sent must not announce speaking"
+    );
 }
