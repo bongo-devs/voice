@@ -17,6 +17,7 @@ const PROTOCOL_VERSION: NonZeroU16 = match NonZeroU16::new(davey::DAVE_PROTOCOL_
 /// Applies DAVE end-to-end encryption to Opus frames via [`davey::DaveSession`].
 pub struct DaveEncryptor {
     session: DaveSession,
+    encryption_required: bool,
 }
 
 impl DaveEncryptor {
@@ -24,11 +25,12 @@ impl DaveEncryptor {
     pub fn new(user_id: u64, channel_id: u64) -> Result<Self, davey::errors::InitError> {
         Ok(Self {
             session: DaveSession::new(PROTOCOL_VERSION, user_id, channel_id, None)?,
+            encryption_required: false,
         })
     }
 
-    /// End-to-end encrypt one frame into `out`, or pass it through unchanged before a group exists.
-    /// `false` means the group is active but encryption failed, so the caller must drop the frame.
+    /// End-to-end encrypt one frame into `out`. Plaintext passthrough is allowed only when DAVE
+    /// encryption was not negotiated; a DAVE-enabled session must wait for its key ratchet.
     ///
     /// Appends rather than returning a buffer: `encrypt_opus` borrows the input during passthrough
     /// (the common case, and every frame of a non-DAVE connection), so handing back an owned buffer
@@ -40,7 +42,7 @@ impl DaveEncryptor {
                 out.extend_from_slice(&encrypted);
                 true
             }
-            Err(_) if !self.session.is_ready() => {
+            Err(_) if !self.encryption_required => {
                 out.extend_from_slice(packet);
                 true
             }
@@ -60,7 +62,19 @@ impl DaveEncryptor {
     /// Enable or disable passthrough mode (used during DAVE transitions / downgrades). When
     /// disabling, davey applies the default ~10 s transition grace period.
     pub fn set_passthrough(&mut self, enabled: bool) {
+        self.encryption_required = !enabled;
         self.session.set_passthrough_mode(enabled, None);
+    }
+
+    /// Whether the Discord session negotiated mandatory DAVE encryption.
+    pub fn set_encryption_required(&mut self, required: bool) {
+        self.encryption_required = required;
+    }
+
+    /// Whether the sender may consume and send a frame. DAVE-required sessions wait for an active
+    /// encryption context; non-DAVE sessions can send passthrough frames immediately.
+    pub fn is_ready_to_send(&self) -> bool {
+        !self.encryption_required || self.session.is_ready()
     }
 
     /// Tear down the MLS group and clear key material, for a downgrade to DAVE v0.
@@ -133,5 +147,33 @@ mod tests {
         let mut out = b"header".to_vec();
         assert!(encryptor.encrypt_into(frame, &mut out));
         assert_eq!(out, [&b"header"[..], &frame[..]].concat());
+    }
+
+    #[test]
+    fn required_encryption_blocks_passthrough_until_the_session_is_ready() {
+        let mut encryptor = DaveEncryptor::new(1234, 5678).expect("create session");
+        assert!(
+            encryptor.is_ready_to_send(),
+            "DAVE is not required by default"
+        );
+
+        encryptor.set_encryption_required(true);
+        assert!(!encryptor.is_ready_to_send());
+        let mut out = b"header".to_vec();
+        assert!(!encryptor.encrypt_into(b"opus-frame-bytes", &mut out));
+        assert_eq!(out, b"header", "must not append plaintext audio");
+
+        encryptor.set_passthrough(true);
+        assert!(
+            encryptor.is_ready_to_send(),
+            "a DAVE downgrade permits audio"
+        );
+        let mut out = b"header".to_vec();
+        assert!(encryptor.encrypt_into(b"opus-frame-bytes", &mut out));
+        assert_eq!(
+            out,
+            [&b"header"[..], &b"opus-frame-bytes"[..]].concat(),
+            "plaintext is permitted after a DAVE downgrade"
+        );
     }
 }

@@ -25,9 +25,12 @@ pub(super) fn handle_dave_event(
             transition_id,
         } => {
             pending.insert(transition_id, protocol_version);
-            // A downgrade to v0 (DAVE disabled): allow plaintext during the grace period.
+            // A downgrade to v0 (DAVE disabled): allow plaintext during the grace period. An
+            // upgrade to DAVE must stop passthrough immediately and wait for the key ratchet.
             if protocol_version == 0 {
                 dave.set_passthrough(true);
+            } else {
+                dave.set_encryption_required(true);
             }
             // Transition 0 is the initial handshake and is not acknowledged.
             if transition_id != 0 {

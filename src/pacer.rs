@@ -79,6 +79,8 @@ pub enum PacerStatus {
     Silence,
     /// Nothing was sent (no audio and silence already drained).
     Idle,
+    /// DAVE is required but its encryption context is not ready; the provider was not polled.
+    WaitingForEncryption,
 }
 
 /// Drives an [`OpusFrameProvider`] at a steady 20 ms cadence into a [`FrameSink`], applying DAVE
@@ -145,6 +147,12 @@ impl<P: OpusFrameProvider, S: FrameSink> FramePacer<P, S> {
     /// Process exactly one frame slot (no internal sleep). Callers that want to control timing
     /// themselves can drive this; most should use [`run`](Self::run).
     pub async fn tick(&mut self) -> io::Result<PacerStatus> {
+        // Do not consume audio while a DAVE-required session is waiting for its MLS key ratchet.
+        // This mirrors the reference poller, which checks E2EE readiness before polling its provider.
+        if !self.dave.is_ready_to_send() {
+            return Ok(PacerStatus::WaitingForEncryption);
+        }
+
         if let Some(frame) = self.provider.provide() {
             self.set_speaking(true);
             self.silence_left = SILENCE_FRAME_COUNT;
@@ -262,5 +270,31 @@ mod tests {
             Instant::now() - resumed >= FRAME_DURATION,
             "a full frame after the resync"
         );
+    }
+
+    #[tokio::test]
+    async fn dave_readiness_does_not_consume_audio_frames() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let provided = Arc::new(AtomicUsize::new(0));
+        let provider_count = Arc::clone(&provided);
+        let provider = move || {
+            provider_count.fetch_add(1, Ordering::Relaxed);
+            Some(bytes::Bytes::from_static(b"opus"))
+        };
+        let sink = crate::sink::VecSink::new();
+        let sink_capture = sink.clone();
+        let mut dave = crate::dave::DaveEncryptor::new(1234, 5678).expect("create session");
+        dave.set_encryption_required(true);
+        let mut pacer = FramePacer::new(provider, sink, dave, 42);
+
+        assert_eq!(
+            pacer.tick().await.expect("tick succeeds"),
+            PacerStatus::WaitingForEncryption
+        );
+        assert_eq!(provided.load(Ordering::Relaxed), 0, "audio remains queued");
+        assert!(sink_capture.is_empty(), "no unencrypted RTP packet is sent");
+        assert_eq!(pacer.header.timestamp, 0, "the RTP clock did not advance");
     }
 }
