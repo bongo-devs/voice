@@ -405,6 +405,7 @@ impl VoiceConnection {
             dave_rx,
             dispatcher.clone(),
             speaking.clone(),
+            dave_version > 0,
             state.clone(),
         ));
 

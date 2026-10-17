@@ -94,6 +94,8 @@ pub struct FramePacer<P: OpusFrameProvider, S: FrameSink> {
     packet: Vec<u8>,
     silence_left: u8,
     speaking: bool,
+    // DAVE negotiated for this connection; while it's on and the ratchet isn't ready, hold audio
+    dave_enabled: bool,
     on_speaking: Option<Box<dyn FnMut(bool) + Send>>,
 }
 
@@ -122,6 +124,7 @@ impl<P: OpusFrameProvider, S: FrameSink> FramePacer<P, S> {
             packet: Vec::with_capacity(MAX_PACKET_BYTES),
             silence_left: 0,
             speaking: false,
+            dave_enabled: false,
             on_speaking: None,
         }
     }
@@ -130,6 +133,11 @@ impl<P: OpusFrameProvider, S: FrameSink> FramePacer<P, S> {
     /// op from here in a real connection).
     pub fn on_speaking(&mut self, handler: impl FnMut(bool) + Send + 'static) {
         self.on_speaking = Some(Box::new(handler));
+    }
+
+    // set when DAVE is negotiated, so frames are held until the key ratchet is ready
+    pub fn set_dave_enabled(&mut self, enabled: bool) {
+        self.dave_enabled = enabled;
     }
 
     /// Whether the pacer currently considers itself speaking.
@@ -145,6 +153,16 @@ impl<P: OpusFrameProvider, S: FrameSink> FramePacer<P, S> {
     /// Process exactly one frame slot (no internal sleep). Callers that want to control timing
     /// themselves can drive this; most should use [`run`](Self::run).
     pub async fn tick(&mut self) -> io::Result<PacerStatus> {
+        // no ratchet yet: hold the frame (don't poll) and send silence instead of plaintext audio
+        if self.dave_enabled && !self.dave.is_ready() {
+            if self.build_packet(&OPUS_SILENCE_FRAME) {
+                self.send().await?;
+            } else {
+                self.header.advance_timestamp(SAMPLES_PER_FRAME);
+            }
+            return Ok(PacerStatus::Silence);
+        }
+
         if let Some(frame) = self.provider.provide() {
             self.set_speaking(true);
             self.silence_left = SILENCE_FRAME_COUNT;

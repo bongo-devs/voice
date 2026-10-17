@@ -14,12 +14,14 @@ pub(super) async fn send_loop<P>(
     mut dave_rx: mpsc::UnboundedReceiver<DaveEvent>,
     dispatcher: EventDispatcher,
     speaking_flag: Arc<AtomicBool>,
+    dave_enabled: bool,
     state: Arc<AtomicU8>,
 ) where
     P: OpusFrameProvider,
 {
     let speaking_tx = ws_tx.clone();
     let mut pacer = FramePacer::with_transport(provider, udp, dave, transport, ssrc);
+    pacer.set_dave_enabled(dave_enabled);
     pacer.on_speaking(move |speaking| {
         // Keep the shared flag in sync so the gateway task can re-announce it on op 11/12.
         speaking_flag.store(speaking, Ordering::Relaxed);

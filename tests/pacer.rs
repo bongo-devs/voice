@@ -1,9 +1,12 @@
 //! Tests the 20 ms pacer: RTP framing, silence draining, and sequence/timestamp progression.
 
+use std::sync::{Arc, Mutex};
+
 use bytes::Bytes;
 use voice::rtp::RTP_HEADER_LEN;
 use voice::{
-    DaveEncryptor, FramePacer, PacerStatus, VecSink, SAMPLES_PER_FRAME, SILENCE_FRAME_COUNT,
+    DaveEncryptor, FramePacer, PacerStatus, VecSink, OPUS_SILENCE_FRAME, SAMPLES_PER_FRAME,
+    SILENCE_FRAME_COUNT,
 };
 
 #[tokio::test]
@@ -57,4 +60,28 @@ async fn paces_audio_then_silence_then_idle() {
     assert_eq!(ssrc, 0xDEAD_BEEF);
 
     assert_eq!(&packets[0][RTP_HEADER_LEN..], b"frame-a");
+}
+
+#[tokio::test]
+async fn frames_are_kept_until_the_key_ratchet_is_ready() {
+    let queued = Arc::new(Mutex::new(vec![Bytes::from_static(b"audio")]));
+    let provider = {
+        let queued = Arc::clone(&queued);
+        move || queued.lock().unwrap().pop()
+    };
+
+    let sink = VecSink::new();
+    // fresh session: DAVE on, but the key ratchet isn't installed yet
+    let dave = DaveEncryptor::new(1, 2).expect("create DAVE session");
+    let mut pacer = FramePacer::new(provider, sink.clone(), dave, 0x1234);
+    pacer.set_dave_enabled(true);
+
+    assert_eq!(pacer.tick().await.unwrap(), PacerStatus::Silence);
+    assert_eq!(pacer.tick().await.unwrap(), PacerStatus::Silence);
+
+    // the frame is still queued, and only silence went out (never plaintext audio)
+    assert_eq!(queued.lock().unwrap().len(), 1);
+    for packet in sink.packets() {
+        assert_eq!(&packet[RTP_HEADER_LEN..], &OPUS_SILENCE_FRAME[..]);
+    }
 }
