@@ -97,6 +97,24 @@ async fn frames_are_kept_until_the_key_ratchet_is_ready() {
 }
 
 #[tokio::test]
+async fn an_empty_frame_is_not_sent() {
+    let mut calls = 0;
+    let provider = move || {
+        calls += 1;
+        (calls == 1).then(Bytes::new)
+    };
+
+    let sink = VecSink::new();
+    let dave = DaveEncryptor::new(1, 2).expect("create DAVE session");
+    let mut pacer = FramePacer::new(provider, sink.clone(), dave, 0x1234);
+
+    assert_eq!(pacer.tick().await.unwrap(), PacerStatus::Silence);
+    let packets = sink.packets();
+    assert_eq!(packets.len(), 1);
+    assert_eq!(&packets[0][RTP_HEADER_LEN..], &OPUS_SILENCE_FRAME[..]);
+}
+
+#[tokio::test]
 async fn a_failed_send_does_not_announce_speaking() {
     let mut frames = vec![Bytes::from_static(b"audio")];
     let provider = move || frames.pop();

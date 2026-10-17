@@ -155,18 +155,16 @@ impl<P: OpusFrameProvider, S: FrameSink> FramePacer<P, S> {
     pub async fn tick(&mut self) -> io::Result<PacerStatus> {
         // no ratchet yet: hold the frame (don't poll) and send silence instead of plaintext audio
         if self.dave_enabled && !self.dave.is_ready() {
-            if self.build_packet(&OPUS_SILENCE_FRAME) {
-                self.send().await?;
-            } else {
-                self.header.advance_timestamp(SAMPLES_PER_FRAME);
-            }
+            self.silence_slot().await?;
             return Ok(PacerStatus::Silence);
         }
 
-        if let Some(frame) = self.provider.provide() {
+        let provided = self.provider.provide();
+        // never send a zero-length payload; a stalled provider counts as the end of speech
+        if let Some(frame) = provided.as_deref().filter(|frame| !frame.is_empty()) {
             self.silence_left = SILENCE_FRAME_COUNT;
             // `false` => active-group encryption failed; drop the frame rather than leak plaintext.
-            if self.build_packet(&frame) {
+            if self.build_packet(frame) {
                 self.send().await?;
                 // announce only once the frame is actually on the wire
                 self.set_speaking(true);
@@ -174,22 +172,32 @@ impl<P: OpusFrameProvider, S: FrameSink> FramePacer<P, S> {
                 // Dropped frames still occupy their 20 ms slot: keep the RTP clock on wall time.
                 self.header.advance_timestamp(SAMPLES_PER_FRAME);
             }
-            Ok(PacerStatus::Sent)
-        } else if self.silence_left > 0 {
+            return Ok(PacerStatus::Sent);
+        }
+        if provided.is_some() {
+            self.silence_left = SILENCE_FRAME_COUNT;
+        }
+
+        if self.silence_left > 0 {
             // Stop speaking as soon as the silence flush begins; the change-detection in
             // `set_speaking` makes this fire once.
             self.set_speaking(false);
             self.silence_left -= 1;
-            if self.build_packet(&OPUS_SILENCE_FRAME) {
-                self.send().await?;
-            } else {
-                // Dropped frames still occupy their 20 ms slot: keep the RTP clock on wall time.
-                self.header.advance_timestamp(SAMPLES_PER_FRAME);
-            }
+            self.silence_slot().await?;
             Ok(PacerStatus::Silence)
         } else {
             self.set_speaking(false);
             Ok(PacerStatus::Idle)
+        }
+    }
+
+    // send one silence frame; if it can't be built, just advance the clock over this slot
+    async fn silence_slot(&mut self) -> io::Result<()> {
+        if self.build_packet(&OPUS_SILENCE_FRAME) {
+            self.send().await
+        } else {
+            self.header.advance_timestamp(SAMPLES_PER_FRAME);
+            Ok(())
         }
     }
 
