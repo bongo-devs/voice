@@ -320,6 +320,9 @@ fn handle_inbound(
                     tracing::info!("voice: gateway session resumed (RESUMED)");
                     state.store(ConnectionState::Connected as u8, Ordering::SeqCst);
                 }
+                // Op 4 `SESSION_DESCRIPTION` again after the handshake (region change): re-announce
+                // so the new session maps our SSRC.
+                4 => reannounce.announce_if_speaking(),
                 // Op 11 `CLIENT_CONNECT`: a batch of `user_ids` that joined. The voice gateway does
                 // not carry their audio SSRCs here, so report 0.
                 11 => {
@@ -431,4 +434,75 @@ pub(super) async fn reconnect(url: &str) -> Result<(WsSink, WsSource), ConnectEr
         Err(_) => return Err("voice gateway reconnect timed out".into()),
     };
     Ok(ws.split())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reannounce(speaking: bool) -> (SpeakingReannounce, mpsc::UnboundedReceiver<Message>) {
+        let (ws_tx, ws_rx) = mpsc::unbounded_channel();
+        let reannounce = SpeakingReannounce {
+            ws_tx,
+            speaking: Arc::new(AtomicBool::new(speaking)),
+            ssrc: 0xABCD,
+        };
+        (reannounce, ws_rx)
+    }
+
+    fn session_description() -> Message {
+        Message::text(json!({ "op": 4, "d": {} }).to_string())
+    }
+
+    #[test]
+    fn speaking_is_reannounced_on_session_description() {
+        let (reannounce, mut ws_rx) = reannounce(true);
+        let (dave_tx, _dave_rx) = mpsc::unbounded_channel();
+        let state = Arc::new(AtomicU8::new(ConnectionState::Connected as u8));
+        let ping = Arc::new(AtomicU64::new(u64::MAX));
+        let mut last_seq = 0;
+        let mut last_ack = Instant::now();
+
+        handle_inbound(
+            session_description(),
+            &dave_tx,
+            &EventDispatcher::new(),
+            &reannounce,
+            &state,
+            &mut last_seq,
+            &ping,
+            None,
+            &mut last_ack,
+        );
+
+        let sent = ws_rx.try_recv().expect("a speaking re-announce");
+        let value: Value = serde_json::from_str(sent.into_text().unwrap().as_str()).unwrap();
+        assert_eq!(value["op"], 5);
+        assert_eq!(value["d"]["speaking"], 1);
+        assert_eq!(value["d"]["ssrc"], 0xABCD);
+    }
+
+    #[test]
+    fn nothing_is_reannounced_when_not_speaking() {
+        let (reannounce, mut ws_rx) = reannounce(false);
+        let (dave_tx, _dave_rx) = mpsc::unbounded_channel();
+        let state = Arc::new(AtomicU8::new(ConnectionState::Connected as u8));
+        let ping = Arc::new(AtomicU64::new(u64::MAX));
+        let mut last_seq = 0;
+        let mut last_ack = Instant::now();
+
+        handle_inbound(
+            session_description(),
+            &dave_tx,
+            &EventDispatcher::new(),
+            &reannounce,
+            &state,
+            &mut last_seq,
+            &ping,
+            None,
+            &mut last_ack,
+        );
+
+        assert!(ws_rx.try_recv().is_err());
+    }
 }
