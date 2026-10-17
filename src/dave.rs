@@ -18,6 +18,7 @@ const PROTOCOL_VERSION: NonZeroU16 = match NonZeroU16::new(davey::DAVE_PROTOCOL_
 pub struct DaveEncryptor {
     session: DaveSession,
     encryption_required: bool,
+    encryption_active: bool,
 }
 
 impl DaveEncryptor {
@@ -26,6 +27,7 @@ impl DaveEncryptor {
         Ok(Self {
             session: DaveSession::new(PROTOCOL_VERSION, user_id, channel_id, None)?,
             encryption_required: false,
+            encryption_active: false,
         })
     }
 
@@ -37,6 +39,10 @@ impl DaveEncryptor {
     /// meant an allocation and a copy per frame — 50/s per player — that the caller then copied a
     /// second time into its RTP packet. Writing straight into that packet leaves one copy.
     pub fn encrypt_into(&mut self, packet: &[u8], out: &mut Vec<u8>) -> bool {
+        if !self.is_ready_to_send() {
+            return false;
+        }
+
         match self.session.encrypt_opus(packet) {
             Ok(encrypted) => {
                 out.extend_from_slice(&encrypted);
@@ -63,6 +69,7 @@ impl DaveEncryptor {
     /// disabling, davey applies the default ~10 s transition grace period.
     pub fn set_passthrough(&mut self, enabled: bool) {
         self.encryption_required = !enabled;
+        self.encryption_active = !enabled;
         self.session.set_passthrough_mode(enabled, None);
     }
 
@@ -71,10 +78,20 @@ impl DaveEncryptor {
         self.encryption_required = required;
     }
 
-    /// Whether the sender may consume and send a frame. DAVE-required sessions wait for an active
-    /// encryption context; non-DAVE sessions can send passthrough frames immediately.
+    /// Set whether Discord has executed the transition that activates outbound DAVE encryption.
+    pub fn set_encryption_active(&mut self, active: bool) {
+        self.encryption_active = active;
+    }
+
+    /// Whether a nonzero DAVE protocol version is currently active for outbound audio.
+    pub fn is_encryption_active(&self) -> bool {
+        self.encryption_active
+    }
+
+    /// Whether the sender may consume and send a frame. Required encryption waits for both the
+    /// protocol transition to activate and the session's key ratchet to become ready.
     pub fn is_ready_to_send(&self) -> bool {
-        !self.encryption_required || self.session.is_ready()
+        !self.encryption_required || (self.encryption_active && self.session.is_ready())
     }
 
     /// Tear down the MLS group and clear key material, for a downgrade to DAVE v0.
@@ -83,6 +100,7 @@ impl DaveEncryptor {
         if let Err(error) = self.session.reset() {
             tracing::warn!(%error, "DAVE: failed to reset session");
         }
+        self.encryption_active = false;
     }
 
     /// Borrow the underlying session (read-only).
@@ -159,6 +177,13 @@ mod tests {
 
         encryptor.set_encryption_required(true);
         assert!(!encryptor.is_ready_to_send());
+        assert!(!encryptor.is_encryption_active());
+        encryptor.set_encryption_active(true);
+        assert!(encryptor.is_encryption_active());
+        assert!(
+            !encryptor.is_ready_to_send(),
+            "activating the transition is not enough until the key ratchet is ready"
+        );
         let mut out = b"header".to_vec();
         assert!(!encryptor.encrypt_into(b"opus-frame-bytes", &mut out));
         assert_eq!(out, b"header", "must not append plaintext audio");

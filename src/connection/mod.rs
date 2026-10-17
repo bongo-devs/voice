@@ -375,6 +375,7 @@ impl VoiceConnection {
             dave.set_passthrough(true);
         } else {
             dave.set_encryption_required(true);
+            dave.set_encryption_active(true);
         }
 
         let (ws_tx, ws_rx) = mpsc::unbounded_channel::<Message>();
