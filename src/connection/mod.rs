@@ -51,6 +51,10 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// fires on a zombie socket: it reads fine, but the gateway behind it is gone.
 const MISSED_ACKS_BEFORE_DEAD: u32 = 3;
 
+/// Resume attempts before the close is reported to the client; a confirmed session restores the
+/// budget.
+const MAX_RECONNECT_ATTEMPTS: u32 = 3;
+
 /// How long the gateway supervisor is left alive after [`VoiceConnection::disconnect`] queues the
 /// close frame, so it actually reaches Discord before the task is aborted.
 const CLOSE_FLUSH_GRACE: Duration = Duration::from_millis(250);

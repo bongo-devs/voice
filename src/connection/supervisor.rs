@@ -1,6 +1,34 @@
 use super::builders::{heartbeat_message, resume_message};
 use super::*;
 
+/// Resume budget across closes: a confirmed session (op 4 or op 9) restores it.
+struct ReconnectBudget {
+    attempts: u32,
+}
+
+impl ReconnectBudget {
+    fn new() -> Self {
+        Self { attempts: 0 }
+    }
+
+    /// The session description arrived or a resume was acknowledged: the budget is whole again.
+    fn confirm(&mut self) {
+        self.attempts = 0;
+    }
+
+    fn can_attempt(&self) -> bool {
+        self.attempts < MAX_RECONNECT_ATTEMPTS
+    }
+
+    fn record_attempt(&mut self) {
+        self.attempts += 1;
+    }
+
+    fn attempts(&self) -> u32 {
+        self.attempts
+    }
+}
+
 /// Gateway supervisor: owns the WebSocket, heartbeats, dispatches inbound ops, and resumes on a
 /// dropped connection while the send task (UDP/DAVE) keeps running.
 #[allow(clippy::too_many_arguments)]
@@ -20,6 +48,9 @@ pub(super) async fn gateway_loop(
     let mut hb = interval(Duration::from_millis(heartbeat_interval_ms.max(1.0) as u64));
     hb.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut nonce: u64 = 0;
+    let mut budget = ReconnectBudget::new();
+    // The handshake's session description starts the budget at zero; this covers op 4/op 9 mid-loop.
+    let mut session_confirmed = false;
 
     loop {
         let outcome = pump(
@@ -34,8 +65,13 @@ pub(super) async fn gateway_loop(
             &mut last_seq,
             &ping,
             &state,
+            &mut session_confirmed,
         )
         .await;
+        if session_confirmed {
+            session_confirmed = false;
+            budget.confirm();
+        }
 
         match outcome {
             // We initiated the close (the connection was disconnected/dropped).
@@ -57,7 +93,7 @@ pub(super) async fn gateway_loop(
                     break;
                 }
                 let mut recovered = false;
-                if is_resumable(code) {
+                if is_resumable(code) && budget.can_attempt() {
                     // Only resume if still Connected; a concurrent `disconnect` sets Closed, and
                     // resuming would revive a connection the caller asked to drop.
                     let claimed = state
@@ -75,11 +111,13 @@ pub(super) async fn gateway_loop(
                     }
                     tracing::warn!(
                         code = code.unwrap_or(0),
+                        attempt = budget.attempts() + 1,
+                        budget = MAX_RECONNECT_ATTEMPTS,
                         "voice: gateway dropped, attempting resume"
                     );
                     // Backoff is jittered because Discord cycling a voice server drops every
                     // connection on the host at once, and a fixed schedule reconnects them in step.
-                    for attempt in 0..5u32 {
+                    while budget.can_attempt() {
                         // Nothing pumps `ws_rx` during this loop, so a `disconnect` queued there is
                         // invisible; watch the state and flush the close frame ourselves instead of
                         // leaking the session until Discord times it out.
@@ -89,7 +127,8 @@ pub(super) async fn gateway_loop(
                             let _ = sink.send(Message::Close(None)).await;
                             return;
                         }
-                        sleep(backoff_delay(attempt)).await;
+                        sleep(backoff_delay(budget.attempts())).await;
+                        budget.record_attempt();
                         if let Ok((new_sink, new_stream)) = reconnect(&resume.url).await {
                             sink = new_sink;
                             stream = new_stream;
@@ -99,6 +138,11 @@ pub(super) async fn gateway_loop(
                             }
                         }
                     }
+                } else if is_resumable(code) {
+                    tracing::warn!(
+                        attempts = budget.attempts(),
+                        "voice: reconnect budget exhausted, reporting the close to the client"
+                    );
                 }
                 if recovered {
                     tracing::info!("voice: gateway session resumed");
@@ -171,6 +215,7 @@ async fn pump(
     last_seq: &mut u64,
     ping: &Arc<AtomicU64>,
     state: &Arc<AtomicU8>,
+    session_confirmed: &mut bool,
 ) -> PumpOutcome {
     // When the last heartbeat was sent, used to compute the round-trip on the matching ACK (op 6).
     let mut last_heartbeat: Option<Instant> = None;
@@ -234,6 +279,7 @@ async fn pump(
                     ping,
                     last_heartbeat,
                     &mut last_ack,
+                    session_confirmed,
                 ),
                 Some(Err(error)) => {
                     dispatcher.dispatch(VoiceEvent::GatewayError {
@@ -285,6 +331,7 @@ fn handle_inbound(
     ping: &Arc<AtomicU64>,
     last_heartbeat: Option<Instant>,
     last_ack: &mut Instant,
+    session_confirmed: &mut bool,
 ) {
     match message {
         // Binary header: seq (2, BE) + op (1) + MLS payload.
@@ -307,6 +354,10 @@ fn handle_inbound(
             };
             forward_dave_json(op, d, dave_tx);
             match op {
+                // Op 4 `SESSION_DESCRIPTION`: a fresh session, so the reconnect budget is restored.
+                4 => {
+                    *session_confirmed = true;
+                }
                 // Op 6 `HEARTBEAT_ACK`: record the round-trip since the last heartbeat as the ping.
                 6 => {
                     *last_ack = Instant::now();
@@ -314,11 +365,11 @@ fn handle_inbound(
                         ping.store(sent.elapsed().as_millis() as u64, Ordering::Relaxed);
                     }
                 }
-                // Op 9 `RESUMED`: the gateway accepted our op 7, so the session is live again (the
-                // supervisor stores `Connected` optimistically when the resume is sent).
+                // Op 9 `RESUMED`: mark the session connected again and restore the reconnect budget.
                 9 => {
                     tracing::info!("voice: gateway session resumed (RESUMED)");
                     state.store(ConnectionState::Connected as u8, Ordering::SeqCst);
+                    *session_confirmed = true;
                 }
                 // Op 11 `CLIENT_CONNECT`: a batch of `user_ids` that joined. The voice gateway does
                 // not carry their audio SSRCs here, so report 0.
@@ -431,4 +482,74 @@ pub(super) async fn reconnect(url: &str) -> Result<(WsSink, WsSource), ConnectEr
         Err(_) => return Err("voice gateway reconnect timed out".into()),
     };
     Ok(ws.split())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Three successful reconnects in a row must not exhaust the budget.
+    #[test]
+    fn confirmed_reconnects_never_exhaust_the_budget() {
+        let mut budget = ReconnectBudget::new();
+        for _ in 0..3 {
+            assert!(budget.can_attempt());
+            budget.record_attempt();
+            budget.confirm();
+        }
+        assert!(
+            budget.can_attempt(),
+            "a confirmed session restores the budget"
+        );
+        assert_eq!(budget.attempts(), 0);
+    }
+
+    #[test]
+    fn unconfirmed_attempts_exhaust_the_budget() {
+        let mut budget = ReconnectBudget::new();
+        for _ in 0..MAX_RECONNECT_ATTEMPTS {
+            assert!(budget.can_attempt());
+            budget.record_attempt();
+        }
+        assert!(
+            !budget.can_attempt(),
+            "attempts without a confirmed session run out"
+        );
+    }
+
+    // Op 4 and op 9 both confirm the session, which is what restores the budget.
+    #[test]
+    fn session_description_and_resumed_confirm_the_session() {
+        for op in [4u64, 9] {
+            let (dave_tx, _dave_rx) = mpsc::unbounded_channel();
+            let dispatcher = EventDispatcher::new();
+            let (speak_tx, _speak_rx) = mpsc::unbounded_channel();
+            let reannounce = SpeakingReannounce {
+                ws_tx: speak_tx,
+                speaking: Arc::new(AtomicBool::new(false)),
+                ssrc: 0,
+            };
+            let state = Arc::new(AtomicU8::new(ConnectionState::Connected as u8));
+            let ping = Arc::new(AtomicU64::new(0));
+            let mut last_seq: u64 = 0;
+            let mut last_ack = Instant::now();
+            let mut confirmed = false;
+            let payload = format!(r#"{{"op":{op},"d":{{}}}}"#);
+
+            handle_inbound(
+                Message::text(payload),
+                &dave_tx,
+                &dispatcher,
+                &reannounce,
+                &state,
+                &mut last_seq,
+                &ping,
+                None,
+                &mut last_ack,
+                &mut confirmed,
+            );
+
+            assert!(confirmed, "op {op} must confirm the session");
+        }
+    }
 }
