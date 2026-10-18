@@ -149,17 +149,13 @@ pub(super) async fn gateway_loop(
                     state.store(ConnectionState::Connected as u8, Ordering::SeqCst);
                 } else {
                     tracing::warn!(
-                        code = code.unwrap_or(0),
+                        code = code.unwrap_or(1006),
                         reason = %reason,
                         by_remote,
                         "voice: gateway closed"
                     );
                     state.store(ConnectionState::Closed as u8, Ordering::SeqCst);
-                    dispatcher.dispatch(VoiceEvent::GatewayClosed {
-                        code: code.unwrap_or(0),
-                        reason,
-                        by_remote,
-                    });
+                    dispatcher.dispatch(closed_event(code, reason, by_remote));
                     break;
                 }
             }
@@ -173,6 +169,27 @@ pub(super) fn is_resumable(code: Option<u16>) -> bool {
     match code {
         Some(code) => RESUMABLE_CLOSE_CODES.contains(&code),
         None => true,
+    }
+}
+
+/// The close event for a dropped connection. A close without a code of its own is an abnormal
+/// drop: report 1006 `Abnormal closure` rather than a zero-code close.
+fn closed_event(code: Option<u16>, reason: String, by_remote: bool) -> VoiceEvent {
+    match code {
+        Some(code) => VoiceEvent::GatewayClosed {
+            code,
+            reason,
+            by_remote,
+        },
+        None => VoiceEvent::GatewayClosed {
+            code: 1006,
+            reason: if reason.is_empty() {
+                "Abnormal closure".into()
+            } else {
+                reason
+            },
+            by_remote,
+        },
     }
 }
 
@@ -294,7 +311,7 @@ async fn pump(
                 None => {
                     return PumpOutcome::Closed {
                         code: None,
-                        reason: "connection closed".into(),
+                        reason: String::new(),
                         by_remote: false,
                     };
                 }
@@ -550,6 +567,45 @@ mod tests {
             );
 
             assert!(confirmed, "op {op} must confirm the session");
+        }
+    }
+
+    #[test]
+    fn abnormal_drops_report_1006_abnormal_closure() {
+        match closed_event(None, String::new(), false) {
+            VoiceEvent::GatewayClosed {
+                code,
+                reason,
+                by_remote,
+            } => {
+                assert_eq!(code, 1006);
+                assert_eq!(reason, "Abnormal closure");
+                assert!(!by_remote);
+            }
+            other => panic!("expected a gateway close, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_closes_keep_their_code_and_reason() {
+        match closed_event(Some(4009), "heartbeat lapse".into(), true) {
+            VoiceEvent::GatewayClosed {
+                code,
+                reason,
+                by_remote,
+            } => {
+                assert_eq!(code, 4009);
+                assert_eq!(reason, "heartbeat lapse");
+                assert!(by_remote);
+            }
+            other => panic!("expected a gateway close, got {other:?}"),
+        }
+        match closed_event(None, "outbound send failed".into(), false) {
+            VoiceEvent::GatewayClosed { code, reason, .. } => {
+                assert_eq!(code, 1006);
+                assert_eq!(reason, "outbound send failed");
+            }
+            other => panic!("expected a gateway close, got {other:?}"),
         }
     }
 }

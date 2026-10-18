@@ -6,6 +6,7 @@ pub(super) fn identify_message(info: &VoiceServerInfo) -> String {
         "d": {
             "server_id": info.guild_id.to_string(),
             "user_id": info.user_id.to_string(),
+            "channel_id": info.channel_id.to_string(),
             "session_id": info.session_id,
             "token": info.token,
             "max_dave_protocol_version": crate::dave::davey::DAVE_PROTOCOL_VERSION,

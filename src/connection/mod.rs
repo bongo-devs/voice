@@ -233,16 +233,12 @@ impl VoiceConnection {
         let handshake = async {
             loop {
                 let Some(message) = stream.next().await else {
-                    // Surface an abnormal drop as a gateway close rather than a bare error, so the
-                    // client still receives a close event for it.
-                    dispatcher.dispatch(VoiceEvent::GatewayClosed {
-                        code: 1006,
-                        reason: "abnormal closure".into(),
-                        by_remote: true,
-                    });
-                    return Err::<(Vec<u8>, u16), ConnectError>(
+                    // Report the failure as an error: no session was established, so a close
+                    // event here would be spurious.
+                    return Err::<(Vec<u8>, u16), ConnectError>(handshake_error(
+                        &dispatcher,
                         "gateway closed during handshake".into(),
-                    );
+                    ));
                 };
                 let text = match message? {
                     Message::Text(t) => t,
@@ -254,20 +250,16 @@ impl VoiceConnection {
                         continue;
                     }
                     // A close here carries the diagnosis the caller needs (4006 stale session, 4009
-                    // timeout, 4014 disconnected, 4004 auth failed), so dispatch it too.
+                    // timeout, 4014 disconnected, 4004 auth failed), so keep it in the error.
                     Message::Close(frame) => {
                         let (code, reason) = frame
                             .map(|f| (u16::from(f.code), f.reason.to_string()))
                             .unwrap_or((1006, String::new()));
                         tracing::warn!(code, reason = %reason, "voice: gateway closed during handshake");
-                        dispatcher.dispatch(VoiceEvent::GatewayClosed {
-                            code,
-                            reason: reason.clone(),
-                            by_remote: true,
-                        });
-                        return Err(
-                            format!("gateway closed during handshake: {code} {reason}").into()
-                        );
+                        return Err(handshake_error(
+                            &dispatcher,
+                            format!("gateway closed during handshake: {code} {reason}"),
+                        ));
                     }
                     _ => continue,
                 };
@@ -526,9 +518,28 @@ impl Drop for VoiceConnection {
     }
 }
 
+/// Report a handshake-phase failure to the listeners and build the matching error. No
+/// `GatewayClosed` is emitted before a session is established; the caller drives the failure.
+fn handshake_error(dispatcher: &EventDispatcher, message: String) -> ConnectError {
+    dispatcher.dispatch(VoiceEvent::GatewayError {
+        message: message.clone(),
+    });
+    message.into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct CapturedEvents(Mutex<Vec<VoiceEvent>>);
+
+    impl VoiceEventListener for CapturedEvents {
+        fn on_event(&self, event: &VoiceEvent) {
+            self.0.lock().unwrap().push(event.clone());
+        }
+    }
 
     fn info(endpoint: &str) -> VoiceServerInfo {
         VoiceServerInfo {
@@ -748,5 +759,58 @@ mod tests {
             serde_json::from_str(media_sink_wants_message().into_text().unwrap().as_str()).unwrap();
         assert_eq!(value["op"], 15);
         assert_eq!(value["d"]["any"], 0);
+    }
+
+    #[test]
+    fn handshake_failures_report_as_gateway_error_only() {
+        let dispatcher = EventDispatcher::new();
+        let captured = Arc::new(CapturedEvents::default());
+        dispatcher.register(captured.clone());
+
+        let error = handshake_error(&dispatcher, "gateway closed during handshake: 4006".into());
+        assert!(error.to_string().contains("4006"));
+
+        let events = captured.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(&events[0], VoiceEvent::GatewayError { .. }),
+            "no close may be reported before a session exists, got {:?}",
+            events[0]
+        );
+    }
+
+    #[test]
+    fn identify_includes_channel_id() {
+        let value: Value =
+            serde_json::from_str(identify_message(&info("region.discord.media")).as_str()).unwrap();
+        assert_eq!(value["d"]["channel_id"].as_str(), Some("3"));
+    }
+
+    #[test]
+    fn disconnect_emits_no_gateway_close() {
+        let dispatcher = EventDispatcher::new();
+        let captured = Arc::new(CapturedEvents::default());
+        dispatcher.register(captured.clone());
+        let (ws_tx, _ws_rx) = mpsc::unbounded_channel();
+        let connection = VoiceConnection {
+            ws_tx,
+            ssrc: 1,
+            state: Arc::new(AtomicU8::new(ConnectionState::Connected as u8)),
+            ping: Arc::new(AtomicU64::new(u64::MAX)),
+            speaking: Arc::new(AtomicBool::new(false)),
+            dispatcher,
+            sender: None,
+            supervisor: None,
+        };
+
+        connection.disconnect();
+
+        let events = captured.0.lock().unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, VoiceEvent::GatewayClosed { .. })),
+            "a disconnect initiated by the caller must stay silent, got {events:?}"
+        );
     }
 }
