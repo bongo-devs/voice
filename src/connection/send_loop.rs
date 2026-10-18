@@ -1,5 +1,5 @@
 use super::builders::speaking_message;
-use super::dave::handle_dave_event;
+use super::dave::{handle_dave_event, send_key_package};
 use super::*;
 
 /// The 20 ms send task, pacing frames through the [`FramePacer`] and applying DAVE MLS messages.
@@ -9,7 +9,7 @@ pub(super) async fn send_loop<P>(
     udp: VoiceUdp,
     dave: DaveEncryptor,
     transport: Box<dyn crate::transport::TransportCipher>,
-    ssrc: u32,
+    ssrc: Arc<AtomicU32>,
     ws_tx: mpsc::UnboundedSender<Message>,
     mut dave_rx: mpsc::UnboundedReceiver<DaveEvent>,
     dispatcher: EventDispatcher,
@@ -19,11 +19,18 @@ pub(super) async fn send_loop<P>(
     P: OpusFrameProvider,
 {
     let speaking_tx = ws_tx.clone();
-    let mut pacer = FramePacer::with_transport(provider, udp, dave, transport, ssrc);
+    let speaking_ssrc = ssrc.clone();
+    let speaking_sync = speaking_flag.clone();
+    let mut pacer =
+        FramePacer::with_transport(provider, udp, dave, transport, ssrc.load(Ordering::Relaxed));
     pacer.on_speaking(move |speaking| {
-        // Keep the shared flag in sync so the gateway task can re-announce it on op 11/12.
-        speaking_flag.store(speaking, Ordering::Relaxed);
-        let _ = speaking_tx.send(speaking_message(speaking, ssrc));
+        // Keep the shared flag in sync; the gateway task re-announces from it on op 4/op 12.
+        speaking_sync.store(speaking, Ordering::Relaxed);
+        // Only the start of a burst is announced; an explicit stop is off by default.
+        if speaking {
+            let ssrc = speaking_ssrc.load(Ordering::Relaxed);
+            let _ = speaking_tx.send(speaking_message(true, ssrc));
+        }
     });
 
     // Pending protocol-version transitions, keyed by transition id (set on prepare, applied on
@@ -37,10 +44,8 @@ pub(super) async fn send_loop<P>(
     // Absolute per-slot deadlines, so a late tick is caught up instead of accumulating.
     let mut clock = FrameClock::new();
 
-    // Transient UDP failures shouldn't tear down the connection, so drop the frame and keep going.
-    // Give up after ~1 s of it, so a genuinely dead socket still lets the gateway reconnect.
+    // Failed datagrams are dropped frames, not a dead session: only the gateway controls that.
     let mut consecutive_send_errors: u32 = 0;
-    const MAX_CONSECUTIVE_SEND_ERRORS: u32 = 50;
 
     loop {
         // UDP sends keep succeeding after a fatal gateway close, so without this the pacer would
@@ -54,31 +59,42 @@ pub(super) async fn send_loop<P>(
                     Ok(_) => consecutive_send_errors = 0,
                     Err(error) => {
                         consecutive_send_errors += 1;
-                        tracing::warn!(
-                            %error,
-                            consecutive = consecutive_send_errors,
-                            "voice: frame send failed; dropping frame"
-                        );
-                        if consecutive_send_errors >= MAX_CONSECUTIVE_SEND_ERRORS {
-                            tracing::warn!(
-                                "voice: too many consecutive send failures, stopping send loop"
+                        // One warn per streak, then keep the per-frame noise at debug level.
+                        if consecutive_send_errors == 1 {
+                            tracing::warn!(%error, "voice: frame send failed; dropping frame");
+                        } else {
+                            tracing::debug!(
+                                %error,
+                                consecutive = consecutive_send_errors,
+                                "voice: frame send failed; dropping frame"
                             );
-                            // Mark closed before reporting, so the supervisor neither resumes nor
-                            // double-reports, then close the gateway so its task stops too.
-                            state.store(ConnectionState::Closed as u8, Ordering::SeqCst);
-                            dispatcher.dispatch(VoiceEvent::GatewayClosed {
-                                code: 4900,
-                                reason: "udp send failed".into(),
-                                by_remote: false,
-                            });
-                            let _ = ws_tx.send(close_message());
-                            break;
                         }
                     }
                 }
             }
             event = dave_rx.recv(), if dave_open => {
                 match event {
+                    // A fresh session replaces the whole UDP leg: new socket, cipher, and SSRC.
+                    Some(DaveEvent::FreshSession {
+                        udp,
+                        transport,
+                        ssrc,
+                        dave_protocol_version,
+                    }) => {
+                        pacer.swap_link(udp, transport, ssrc);
+                        pending.clear();
+                        if dave_protocol_version > 0 {
+                            if let Err(error) = pacer.dave_mut().reinit_version(dave_protocol_version) {
+                                tracing::warn!(%error, "DAVE: failed to reinit for the fresh session");
+                            }
+                            send_key_package(pacer.dave_mut(), &ws_tx);
+                        } else {
+                            pacer.dave_mut().reset();
+                        }
+                        was_ready = pacer.dave_mut().is_ready();
+                        // The fresh link starts silent: reflect that in the shared flag.
+                        speaking_flag.store(false, Ordering::Relaxed);
+                    }
                     Some(event) => {
                         handle_dave_event(
                             pacer.dave_mut(),

@@ -132,6 +132,16 @@ impl<P: OpusFrameProvider, S: FrameSink> FramePacer<P, S> {
         self.on_speaking = Some(Box::new(handler));
     }
 
+    /// Replace the UDP link for a fresh session: new socket, cipher, and SSRC. The provider and
+    /// DAVE session carry over; speaking state resets so the next audio frame re-announces it.
+    pub fn swap_link(&mut self, sink: S, transport: Box<dyn TransportCipher>, ssrc: u32) {
+        self.sink = sink;
+        self.transport = transport;
+        self.header = RtpHeader::new(ssrc);
+        self.silence_left = 0;
+        self.speaking = false;
+    }
+
     /// Whether the pacer currently considers itself speaking.
     pub fn is_speaking(&self) -> bool {
         self.speaking

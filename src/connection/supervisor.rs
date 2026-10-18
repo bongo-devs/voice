@@ -1,4 +1,4 @@
-use super::builders::{heartbeat_message, resume_message};
+use super::builders::{heartbeat_message, identify_message, resume_message};
 use super::*;
 
 /// Resume budget across closes: a confirmed session (op 4 or op 9) restores it.
@@ -29,25 +29,70 @@ impl ReconnectBudget {
     }
 }
 
+/// Which handshake a reconnect performs: op 7 while the session is believed alive, otherwise a
+/// fresh op 0 that rebuilds the session from scratch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionMode {
+    Resume,
+    Identify,
+}
+
+/// What one close should do, given the session state and the remaining budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseDecision {
+    /// Reconnect with the current session mode.
+    Reconnect,
+    /// The gateway forgot the session: reconnect fresh once, then report if it drops again.
+    ReconnectFresh,
+    /// Fatal, or the budget is exhausted: report the close and stop.
+    Report,
+}
+
+fn close_decision(code: Option<u16>, mode: SessionMode, can_attempt: bool) -> CloseDecision {
+    if code == Some(SESSION_NO_LONGER_VALID) {
+        return match (mode, can_attempt) {
+            (SessionMode::Resume, true) => CloseDecision::ReconnectFresh,
+            _ => CloseDecision::Report,
+        };
+    }
+    if is_resumable(code) && can_attempt {
+        CloseDecision::Reconnect
+    } else {
+        CloseDecision::Report
+    }
+}
+
+/// The op-7 / op-0 payload a reconnect sends for the current mode.
+fn reconnect_message(session: &SessionInfo, mode: SessionMode, last_seq: u64) -> Message {
+    match mode {
+        SessionMode::Resume => resume_message(session, last_seq),
+        SessionMode::Identify => Message::text(identify_message(session)),
+    }
+}
+
 /// Gateway supervisor: owns the WebSocket, heartbeats, dispatches inbound ops, and resumes on a
 /// dropped connection while the send task (UDP/DAVE) keeps running.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn gateway_loop(
-    resume: ResumeInfo,
+    session: SessionInfo,
     mut sink: WsSink,
     mut stream: WsSource,
     mut ws_rx: mpsc::UnboundedReceiver<Message>,
     dave_tx: mpsc::UnboundedSender<DaveEvent>,
     heartbeat_interval_ms: f64,
     mut last_seq: u64,
+    ssrc: Arc<AtomicU32>,
     state: Arc<AtomicU8>,
     ping: Arc<AtomicU64>,
     dispatcher: EventDispatcher,
     reannounce: SpeakingReannounce,
 ) {
-    let mut hb = interval(Duration::from_millis(heartbeat_interval_ms.max(1.0) as u64));
-    hb.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut nonce: u64 = 0;
+    let period = Duration::from_millis(heartbeat_interval_ms.max(1.0) as u64);
+    // The first beat follows a full interval; HELLO re-arms the schedule on every connection.
+    let mut hb = interval_at(tokio::time::Instant::now() + period, period);
+    let mut mode = SessionMode::Resume;
+    // A fresh session's UDP link, negotiated on READY and handed to the send task on op 4.
+    let mut pending: Option<PendingLink> = None;
     let mut budget = ReconnectBudget::new();
     // The handshake's session description starts the budget at zero; this covers op 4/op 9 mid-loop.
     let mut session_confirmed = false;
@@ -61,11 +106,13 @@ pub(super) async fn gateway_loop(
             &dispatcher,
             &reannounce,
             &mut hb,
-            &mut nonce,
             &mut last_seq,
             &ping,
             &state,
             &mut session_confirmed,
+            &mut mode,
+            &mut pending,
+            &ssrc,
         )
         .await;
         if session_confirmed {
@@ -92,9 +139,13 @@ pub(super) async fn gateway_loop(
                     tracing::debug!(code = code.unwrap_or(0), "voice: gateway closed locally");
                     break;
                 }
+                let decision = close_decision(code, mode, budget.can_attempt());
                 let mut recovered = false;
-                if is_resumable(code) && budget.can_attempt() {
-                    // Only resume if still Connected; a concurrent `disconnect` sets Closed, and
+                if decision != CloseDecision::Report {
+                    if decision == CloseDecision::ReconnectFresh {
+                        mode = SessionMode::Identify;
+                    }
+                    // Only reconnect if still Connected; a concurrent `disconnect` sets Closed, and
                     // resuming would revive a connection the caller asked to drop.
                     let claimed = state
                         .compare_exchange(
@@ -110,13 +161,14 @@ pub(super) async fn gateway_loop(
                         return;
                     }
                     tracing::warn!(
-                        code = code.unwrap_or(0),
+                        code = code.unwrap_or(1006),
                         attempt = budget.attempts() + 1,
                         budget = MAX_RECONNECT_ATTEMPTS,
-                        "voice: gateway dropped, attempting resume"
+                        fresh = mode == SessionMode::Identify,
+                        "voice: gateway dropped, reconnecting"
                     );
-                    // Backoff is jittered because Discord cycling a voice server drops every
-                    // connection on the host at once, and a fixed schedule reconnects them in step.
+                    // Attempts run back to back: the gateway restores sessions for a short window,
+                    // so the delay itself is the risk.
                     while budget.can_attempt() {
                         // Nothing pumps `ws_rx` during this loop, so a `disconnect` queued there is
                         // invisible; watch the state and flush the close frame ourselves instead of
@@ -127,36 +179,43 @@ pub(super) async fn gateway_loop(
                             let _ = sink.send(Message::Close(None)).await;
                             return;
                         }
-                        sleep(backoff_delay(budget.attempts())).await;
                         budget.record_attempt();
-                        if let Ok((new_sink, new_stream)) = reconnect(&resume.url).await {
+                        if let Ok((new_sink, new_stream)) = reconnect(&session.url).await {
                             sink = new_sink;
                             stream = new_stream;
-                            if sink.send(resume_message(&resume, last_seq)).await.is_ok() {
+                            if sink
+                                .send(reconnect_message(&session, mode, last_seq))
+                                .await
+                                .is_ok()
+                            {
                                 recovered = true;
                                 break;
                             }
                         }
                     }
-                } else if is_resumable(code) {
+                } else if (is_resumable(code) || code == Some(SESSION_NO_LONGER_VALID))
+                    && !budget.can_attempt()
+                {
                     tracing::warn!(
                         attempts = budget.attempts(),
                         "voice: reconnect budget exhausted, reporting the close to the client"
                     );
                 }
                 if recovered {
-                    tracing::info!("voice: gateway session resumed");
+                    tracing::info!("voice: gateway reconnected");
                     state.store(ConnectionState::Connected as u8, Ordering::SeqCst);
                 } else {
+                    // An abnormal drop has no code of its own; report it as one.
+                    let code = code.unwrap_or(1006);
                     tracing::warn!(
-                        code = code.unwrap_or(0),
+                        code,
                         reason = %reason,
                         by_remote,
                         "voice: gateway closed"
                     );
                     state.store(ConnectionState::Closed as u8, Ordering::SeqCst);
                     dispatcher.dispatch(VoiceEvent::GatewayClosed {
-                        code: code.unwrap_or(0),
+                        code,
                         reason,
                         by_remote,
                     });
@@ -176,16 +235,6 @@ pub(super) fn is_resumable(code: Option<u16>) -> bool {
     }
 }
 
-/// Resume backoff: `500 ms * 2^attempt` capped at 8 s, plus up to 500 ms of clock-derived jitter.
-pub(super) fn backoff_delay(attempt: u32) -> Duration {
-    let base = Duration::from_millis(500 << attempt.min(4));
-    let jitter = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| (since.subsec_nanos() % 500_000) as u64)
-        .unwrap_or(0);
-    base + Duration::from_micros(jitter)
-}
-
 /// Outcome of one [`pump`] over a single WebSocket lifetime.
 enum PumpOutcome {
     /// The outbound channel closed (the connection was disconnected or dropped), so stop entirely.
@@ -201,6 +250,23 @@ enum PumpOutcome {
     },
 }
 
+/// Follow-up work an inbound message asks the pump to run (it owns the WebSocket and DAVE channel).
+enum Inbound {
+    /// No follow-up.
+    None,
+    /// Op 2 `READY`: negotiate the fresh session's UDP link.
+    FreshReady(ReadyVoice),
+    /// Op 4 `SESSION_DESCRIPTION`: swap the pending link into the send task.
+    FreshSession {
+        /// Transport encryption secret.
+        key: Vec<u8>,
+        /// DAVE protocol version negotiated for this session.
+        dave_protocol_version: u16,
+    },
+    /// The message makes the session unusable.
+    Fatal(String),
+}
+
 /// Drive one WebSocket until it drops or the outbound channel closes.
 #[allow(clippy::too_many_arguments)]
 async fn pump(
@@ -211,18 +277,16 @@ async fn pump(
     dispatcher: &EventDispatcher,
     reannounce: &SpeakingReannounce,
     hb: &mut tokio::time::Interval,
-    nonce: &mut u64,
     last_seq: &mut u64,
     ping: &Arc<AtomicU64>,
     state: &Arc<AtomicU8>,
     session_confirmed: &mut bool,
+    mode: &mut SessionMode,
+    pending: &mut Option<PendingLink>,
+    ssrc: &Arc<AtomicU32>,
 ) -> PumpOutcome {
     // When the last heartbeat was sent, used to compute the round-trip on the matching ACK (op 6).
     let mut last_heartbeat: Option<Instant> = None;
-    // A gateway that stops acking is dead even though its TCP connection still reads fine, so this
-    // watchdog is what stops a zombie session swallowing every frame forever.
-    let mut last_ack = Instant::now();
-    let ack_timeout = hb.period() * MISSED_ACKS_BEFORE_DEAD;
     loop {
         tokio::select! {
             outbound = ws_rx.recv() => match outbound {
@@ -241,21 +305,8 @@ async fn pump(
                 }
             },
             _ = hb.tick() => {
-                if last_ack.elapsed() > ack_timeout {
-                    tracing::warn!(
-                        elapsed_ms = last_ack.elapsed().as_millis(),
-                        "voice: no heartbeat ack, treating the gateway as dead"
-                    );
-                    // `code: None` is resumable, so the supervisor reconnects and sends op 7.
-                    return PumpOutcome::Closed {
-                        code: None,
-                        reason: "heartbeat ack timeout".into(),
-                        by_remote: false,
-                    };
-                }
-                *nonce = nonce.wrapping_add(1);
                 if sink
-                    .send(heartbeat_message(*nonce, *last_seq))
+                    .send(heartbeat_message(*last_seq))
                     .await
                     .is_err()
                 {
@@ -269,32 +320,113 @@ async fn pump(
             },
             inbound = stream.next() => match inbound {
                 Some(Ok(Message::Close(frame))) => return close_outcome(frame),
-                Some(Ok(message)) => handle_inbound(
-                    message,
-                    dave_tx,
-                    dispatcher,
-                    reannounce,
-                    state,
-                    last_seq,
-                    ping,
-                    last_heartbeat,
-                    &mut last_ack,
-                    session_confirmed,
-                ),
+                Some(Ok(message)) => {
+                    match handle_inbound(
+                        message,
+                        dave_tx,
+                        dispatcher,
+                        reannounce,
+                        state,
+                        last_seq,
+                        ping,
+                        last_heartbeat,
+                        session_confirmed,
+                        hb,
+                        pending,
+                    ) {
+                        Inbound::None => {}
+                        Inbound::FreshReady(ready) => {
+                            let negotiated = establish_link(
+                                sink,
+                                dispatcher,
+                                ready.ssrc,
+                                &ready.ip,
+                                ready.port,
+                                &ready.modes,
+                            )
+                            .await;
+                            match negotiated {
+                                Ok((udp, negotiated_mode)) => {
+                                    ssrc.store(ready.ssrc, Ordering::Relaxed);
+                                    *mode = SessionMode::Resume;
+                                    *pending = Some(PendingLink {
+                                        udp,
+                                        mode: negotiated_mode,
+                                    });
+                                }
+                                Err(error) => {
+                                    dispatcher.dispatch(VoiceEvent::GatewayError {
+                                        message: error.to_string(),
+                                    });
+                                    return PumpOutcome::Closed {
+                                        code: None,
+                                        reason: "session renegotiation failed".into(),
+                                        by_remote: false,
+                                    };
+                                }
+                            }
+                        }
+                        Inbound::FreshSession {
+                            key,
+                            dave_protocol_version,
+                        } => {
+                            let Some(link) = pending.take() else {
+                                return PumpOutcome::Closed {
+                                    code: None,
+                                    reason: "session description without a selected protocol".into(),
+                                    by_remote: false,
+                                };
+                            };
+                            let transport = match cipher_for_mode(link.mode, &key) {
+                                Ok(transport) => transport,
+                                Err(error) => {
+                                    dispatcher.dispatch(VoiceEvent::GatewayError {
+                                        message: error.clone(),
+                                    });
+                                    return PumpOutcome::Closed {
+                                        code: None,
+                                        reason: error,
+                                        by_remote: false,
+                                    };
+                                }
+                            };
+                            let _ = dave_tx.send(DaveEvent::FreshSession {
+                                udp: link.udp,
+                                transport,
+                                ssrc: ssrc.load(Ordering::Relaxed),
+                                dave_protocol_version,
+                            });
+                            dispatcher.dispatch(VoiceEvent::SessionDescription {
+                                mode: link.mode.to_string(),
+                                dave_protocol_version,
+                            });
+                        }
+                        Inbound::Fatal(reason) => {
+                            dispatcher.dispatch(VoiceEvent::GatewayError {
+                                message: reason.clone(),
+                            });
+                            return PumpOutcome::Closed {
+                                code: None,
+                                reason,
+                                by_remote: false,
+                            };
+                        }
+                    }
+                }
                 Some(Err(error)) => {
                     dispatcher.dispatch(VoiceEvent::GatewayError {
                         message: error.to_string(),
                     });
                     return PumpOutcome::Closed {
-                        code: None,
-                        reason: "connection error".into(),
+                        code: Some(4000),
+                        reason: "Internal error".into(),
                         by_remote: false,
                     };
                 }
                 None => {
                     return PumpOutcome::Closed {
                         code: None,
-                        reason: "connection closed".into(),
+                        reason: "Abnormal closure".into(),
                         by_remote: false,
                     };
                 }
@@ -319,7 +451,7 @@ fn close_outcome(frame: Option<CloseFrame>) -> PumpOutcome {
     }
 }
 
-/// Track the server sequence and forward DAVE ops; ignore keep-alive / informational ops.
+/// Track the server sequence, forward DAVE ops, and report follow-up work the pump must run.
 #[allow(clippy::too_many_arguments)]
 fn handle_inbound(
     message: Message,
@@ -330,9 +462,10 @@ fn handle_inbound(
     last_seq: &mut u64,
     ping: &Arc<AtomicU64>,
     last_heartbeat: Option<Instant>,
-    last_ack: &mut Instant,
     session_confirmed: &mut bool,
-) {
+    hb: &mut tokio::time::Interval,
+    pending: &Option<PendingLink>,
+) -> Inbound {
     match message {
         // Binary header: seq (2, BE) + op (1) + MLS payload.
         Message::Binary(bytes) => {
@@ -340,36 +473,61 @@ fn handle_inbound(
                 *last_seq = (*last_seq).max(u16::from_be_bytes([bytes[0], bytes[1]]) as u64);
             }
             forward_dave_binary(&bytes, dave_tx);
+            Inbound::None
         }
         Message::Text(text) => {
             let Ok(value) = serde_json::from_str::<Value>(text.as_str()) else {
-                return;
+                return Inbound::None;
             };
             if let Some(s) = value["seq"].as_u64() {
                 *last_seq = (*last_seq).max(s);
             }
             let d = &value["d"];
             let Some(op) = value["op"].as_u64() else {
-                return;
+                return Inbound::None;
             };
             forward_dave_json(op, d, dave_tx);
             match op {
-                // Op 4 `SESSION_DESCRIPTION`: a fresh session, so the reconnect budget is restored.
+                // Op 2 `READY`: a fresh session; its UDP link must be negotiated before op 4 keys it.
+                2 => match ready_from_payload(d) {
+                    Ok(ready) => Inbound::FreshReady(ready),
+                    Err(error) => Inbound::Fatal(error),
+                },
+                // Op 4 `SESSION_DESCRIPTION`: restores the budget, re-announces speaking, and
+                // switches in the fresh link when one was negotiated.
                 4 => {
                     *session_confirmed = true;
+                    reannounce.announce_if_speaking();
+                    if pending.is_some() {
+                        Inbound::FreshSession {
+                            key: session_secret_key(d),
+                            dave_protocol_version: session_dave_version(d),
+                        }
+                    } else {
+                        Inbound::None
+                    }
                 }
                 // Op 6 `HEARTBEAT_ACK`: record the round-trip since the last heartbeat as the ping.
                 6 => {
-                    *last_ack = Instant::now();
                     if let Some(sent) = last_heartbeat {
                         ping.store(sent.elapsed().as_millis() as u64, Ordering::Relaxed);
                     }
+                    Inbound::None
+                }
+                // Op 8 `HELLO`: (re)arm the heartbeat schedule for this connection.
+                8 => {
+                    if let Some(ms) = d["heartbeat_interval"].as_f64() {
+                        let period = Duration::from_millis(ms.max(1.0) as u64);
+                        *hb = interval_at(tokio::time::Instant::now() + period, period);
+                    }
+                    Inbound::None
                 }
                 // Op 9 `RESUMED`: mark the session connected again and restore the reconnect budget.
                 9 => {
                     tracing::info!("voice: gateway session resumed (RESUMED)");
                     state.store(ConnectionState::Connected as u8, Ordering::SeqCst);
                     *session_confirmed = true;
+                    Inbound::None
                 }
                 // Op 11 `CLIENT_CONNECT`: a batch of `user_ids` that joined. The voice gateway does
                 // not carry their audio SSRCs here, so report 0.
@@ -382,11 +540,10 @@ fn handle_inbound(
                             });
                         }
                     }
-                    // A client joined: re-announce speaking so it maps our SSRC and hears us.
-                    reannounce.announce_if_speaking();
+                    Inbound::None
                 }
-                // Op 12 `VIDEO`: a single user's stream SSRCs changed (carries `user_id` +
-                // `audio_ssrc`).
+                // Op 12 `VIDEO`: a single user's stream SSRCs changed; re-announce so late joiners
+                // map our SSRC and hear us.
                 12 => {
                     if let Some(user_id) = d["user_id"].as_str() {
                         dispatcher.dispatch(VoiceEvent::UserConnected {
@@ -394,8 +551,8 @@ fn handle_inbound(
                             audio_ssrc: d["audio_ssrc"].as_u64().unwrap_or(0) as u32,
                         });
                     }
-                    // A client joined: re-announce speaking so it maps our SSRC and hears us.
                     reannounce.announce_if_speaking();
+                    Inbound::None
                 }
                 // Op 13 `CLIENT_DISCONNECT`.
                 13 => {
@@ -404,11 +561,12 @@ fn handle_inbound(
                             user_id: user_id.to_string(),
                         });
                     }
+                    Inbound::None
                 }
-                _ => {}
+                _ => Inbound::None,
             }
         }
-        _ => {}
+        _ => Inbound::None,
     }
 }
 
@@ -477,7 +635,7 @@ pub(super) fn forward_dave_json(op: u64, d: &Value, dave_tx: &mpsc::UnboundedSen
 }
 
 pub(super) async fn reconnect(url: &str) -> Result<(WsSink, WsSource), ConnectError> {
-    let (ws, _response) = match timeout(HANDSHAKE_TIMEOUT, connect_async(url)).await {
+    let (ws, _response) = match timeout(CONNECT_TIMEOUT, connect_async(url)).await {
         Ok(result) => result?,
         Err(_) => return Err("voice gateway reconnect timed out".into()),
     };
@@ -487,6 +645,17 @@ pub(super) async fn reconnect(url: &str) -> Result<(WsSink, WsSource), ConnectEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn session() -> SessionInfo {
+        SessionInfo {
+            url: "wss://x/?v=8".into(),
+            server_id: 1,
+            user_id: 2,
+            channel_id: 3,
+            session_id: "s".into(),
+            token: "t".into(),
+        }
+    }
 
     // Three successful reconnects in a row must not exhaust the budget.
     #[test]
@@ -517,9 +686,77 @@ mod tests {
         );
     }
 
-    // Op 4 and op 9 both confirm the session, which is what restores the budget.
     #[test]
-    fn session_description_and_resumed_confirm_the_session() {
+    fn session_invalid_close_attempts_one_fresh_identify() {
+        assert_eq!(
+            close_decision(Some(4006), SessionMode::Resume, true),
+            CloseDecision::ReconnectFresh
+        );
+        assert_eq!(
+            close_decision(Some(4006), SessionMode::Resume, false),
+            CloseDecision::Report
+        );
+        assert_eq!(
+            close_decision(Some(4006), SessionMode::Identify, true),
+            CloseDecision::Report,
+            "a second 4006 is fatal"
+        );
+    }
+
+    #[test]
+    fn resumable_codes_reconnect_and_fatal_codes_report() {
+        assert_eq!(
+            close_decision(None, SessionMode::Resume, true),
+            CloseDecision::Reconnect
+        );
+        assert_eq!(
+            close_decision(Some(1006), SessionMode::Resume, true),
+            CloseDecision::Reconnect
+        );
+        assert_eq!(
+            close_decision(Some(4009), SessionMode::Identify, true),
+            CloseDecision::Reconnect
+        );
+        assert_eq!(
+            close_decision(Some(1006), SessionMode::Resume, false),
+            CloseDecision::Report
+        );
+        assert_eq!(
+            close_decision(Some(4004), SessionMode::Resume, true),
+            CloseDecision::Report
+        );
+        assert_eq!(
+            close_decision(Some(1000), SessionMode::Resume, true),
+            CloseDecision::Report
+        );
+    }
+
+    #[test]
+    fn reconnects_use_resume_or_identify_per_mode() {
+        let value: Value = serde_json::from_str(
+            reconnect_message(&session(), SessionMode::Resume, 3)
+                .into_text()
+                .unwrap()
+                .as_str(),
+        )
+        .unwrap();
+        assert_eq!(value["op"], 7);
+        assert_eq!(value["d"]["seq_ack"], 3);
+
+        let value: Value = serde_json::from_str(
+            reconnect_message(&session(), SessionMode::Identify, 3)
+                .into_text()
+                .unwrap()
+                .as_str(),
+        )
+        .unwrap();
+        assert_eq!(value["op"], 0);
+        assert_eq!(value["d"]["channel_id"], "3");
+    }
+
+    // Op 4 and op 9 both confirm the session, which is what restores the budget.
+    #[tokio::test]
+    async fn session_description_and_resumed_confirm_the_session() {
         for op in [4u64, 9] {
             let (dave_tx, _dave_rx) = mpsc::unbounded_channel();
             let dispatcher = EventDispatcher::new();
@@ -527,16 +764,19 @@ mod tests {
             let reannounce = SpeakingReannounce {
                 ws_tx: speak_tx,
                 speaking: Arc::new(AtomicBool::new(false)),
-                ssrc: 0,
+                ssrc: Arc::new(AtomicU32::new(0)),
             };
             let state = Arc::new(AtomicU8::new(ConnectionState::Connected as u8));
             let ping = Arc::new(AtomicU64::new(0));
             let mut last_seq: u64 = 0;
-            let mut last_ack = Instant::now();
             let mut confirmed = false;
+            let mut hb = interval_at(
+                tokio::time::Instant::now() + Duration::from_secs(60),
+                Duration::from_secs(60),
+            );
             let payload = format!(r#"{{"op":{op},"d":{{}}}}"#);
 
-            handle_inbound(
+            let inbound = handle_inbound(
                 Message::text(payload),
                 &dave_tx,
                 &dispatcher,
@@ -545,11 +785,50 @@ mod tests {
                 &mut last_seq,
                 &ping,
                 None,
-                &mut last_ack,
                 &mut confirmed,
+                &mut hb,
+                &None,
             );
 
+            assert!(matches!(inbound, Inbound::None));
             assert!(confirmed, "op {op} must confirm the session");
         }
+    }
+
+    // HELLO arms the heartbeat schedule for the connection that sent it.
+    #[tokio::test]
+    async fn hello_reschedules_heartbeats() {
+        let (dave_tx, _dave_rx) = mpsc::unbounded_channel();
+        let dispatcher = EventDispatcher::new();
+        let (speak_tx, _speak_rx) = mpsc::unbounded_channel();
+        let reannounce = SpeakingReannounce {
+            ws_tx: speak_tx,
+            speaking: Arc::new(AtomicBool::new(false)),
+            ssrc: Arc::new(AtomicU32::new(0)),
+        };
+        let state = Arc::new(AtomicU8::new(ConnectionState::Connected as u8));
+        let ping = Arc::new(AtomicU64::new(0));
+        let mut last_seq: u64 = 0;
+        let mut confirmed = false;
+        let mut hb = interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+
+        handle_inbound(
+            Message::text(r#"{"op":8,"d":{"heartbeat_interval":5000}}"#),
+            &dave_tx,
+            &dispatcher,
+            &reannounce,
+            &state,
+            &mut last_seq,
+            &ping,
+            None,
+            &mut confirmed,
+            &mut hb,
+            &None,
+        );
+
+        assert_eq!(hb.period(), Duration::from_millis(5000));
     }
 }

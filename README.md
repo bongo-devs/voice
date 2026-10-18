@@ -5,8 +5,8 @@ encrypts them with DAVE and the negotiated transport cipher, and sends them to D
 
 ## Features
 
-- Voice gateway v8: `IDENTIFY` / `RESUME` with `seq_ack`, heartbeat ACK watchdog, and
-  resume-on-disconnect with exponential backoff
+- Voice gateway v8: `IDENTIFY` / `RESUME` with `seq_ack`, immediate reconnects on a bounded
+  attempt budget, and a fresh `IDENTIFY` when the gateway has dropped the session
 - UDP IP discovery (with retries) and RTP packetization
 - Transport AEAD: `aead_aes256_gcm_rtpsize` and `aead_xchacha20_poly1305_rtpsize`
 - DAVE end-to-end encryption — MLS, gateway ops 21–31 — including protocol and epoch transitions,

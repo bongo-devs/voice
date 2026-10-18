@@ -1,11 +1,14 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use super::*;
 
-pub(super) fn identify_message(info: &VoiceServerInfo) -> String {
+pub(super) fn identify_message(info: &SessionInfo) -> String {
     json!({
         "op": 0,
         "d": {
-            "server_id": info.guild_id.to_string(),
+            "server_id": info.server_id.to_string(),
             "user_id": info.user_id.to_string(),
+            "channel_id": info.channel_id.to_string(),
             "session_id": info.session_id,
             "token": info.token,
             "max_dave_protocol_version": crate::dave::davey::DAVE_PROTOCOL_VERSION,
@@ -21,18 +24,47 @@ pub(super) fn select_protocol_message(discovered: &DiscoveredAddress, mode: &str
         "op": 1,
         "d": {
             "protocol": "udp",
-            "data": { "address": discovered.ip, "port": discovered.port, "mode": mode }
+            "codecs": [{ "name": "opus", "payload_type": crate::rtp::PAYLOAD_TYPE_OPUS, "priority": 1000, "type": "audio" }],
+            "data": { "address": discovered.ip, "port": discovered.port, "mode": mode },
+            // The UDP address is also mirrored at the top level of the payload.
+            "address": discovered.ip,
+            "port": discovered.port,
+            "mode": mode,
         }
     })
     .to_string()
 }
 
-pub(super) fn heartbeat_message(nonce: u64, seq_ack: u64) -> Message {
-    // Voice gateway v8: heartbeat carries a nonce and the last acknowledged sequence number.
-    Message::text(json!({ "op": 3, "d": { "t": nonce, "seq_ack": seq_ack } }).to_string())
+/// Voice gateway v8 heartbeat: epoch-millis timestamp plus the last acknowledged sequence.
+pub(super) fn heartbeat_message(seq_ack: u64) -> Message {
+    Message::text(json!({ "op": 3, "d": { "t": now_millis(), "seq_ack": seq_ack } }).to_string())
 }
 
-pub(super) fn resume_message(resume: &ResumeInfo, seq_ack: u64) -> Message {
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The op-4 transport secret: a JSON byte array.
+pub(super) fn session_secret_key(d: &Value) -> Vec<u8> {
+    d["secret_key"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|n| n.as_u64().map(|x| x as u8))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The op-4 DAVE protocol version (0 = DAVE disabled for the channel).
+pub(super) fn session_dave_version(d: &Value) -> u16 {
+    d["dave_protocol_version"].as_u64().unwrap_or(0) as u16
+}
+
+pub(super) fn resume_message(resume: &SessionInfo, seq_ack: u64) -> Message {
     Message::text(
         json!({
             "op": 7,
@@ -66,6 +98,19 @@ pub(super) fn speaking_message(speaking: bool, ssrc: u32) -> Message {
         json!({ "op": 5, "d": { "speaking": speaking as u8, "delay": 0, "ssrc": ssrc } })
             .to_string(),
     )
+}
+
+/// Op 12 `VIDEO`: advertise our audio stream; video and rtx stay zero for an audio-only bot.
+pub(super) fn video_message(ssrc: u32) -> Message {
+    Message::text(
+        json!({ "op": 12, "d": { "audio_ssrc": ssrc, "video_ssrc": 0, "rtx_ssrc": 0 } })
+            .to_string(),
+    )
+}
+
+/// Op 16 `VOICE_BACKEND_VERSION`: ask the gateway for its backend versions right after READY.
+pub(super) fn backend_version_message() -> Message {
+    Message::text(json!({ "op": 16, "d": {} }).to_string())
 }
 
 /// Op 15 `MEDIA_SINK_WANTS` with `any: 0`. There is no receive path here, so stop the SFU

@@ -52,6 +52,13 @@ impl DaveEncryptor {
     /// Without it the new group's proposals fail with `Wrong Epoch` or `AlreadyInGroup`.
     pub fn reinit(&mut self) -> Result<(), davey::errors::ReinitError> {
         let version = self.session.protocol_version();
+        self.reinit_version(version.get())
+    }
+
+    /// Re-initialise the session at `version`, for a fresh session that negotiated its own DAVE
+    /// version. `0` falls back to the newest version davey supports.
+    pub fn reinit_version(&mut self, version: u16) -> Result<(), davey::errors::ReinitError> {
+        let version = NonZeroU16::new(version).unwrap_or(PROTOCOL_VERSION);
         let user_id = self.session.user_id();
         let channel_id = self.session.channel_id();
         self.session.reinit(version, user_id, channel_id, None)

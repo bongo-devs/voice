@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
+use tokio::time::{interval_at, sleep, timeout};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
@@ -43,13 +43,11 @@ const RESUMABLE_CLOSE_CODES: &[u16] = &[
     1001, 1006, 4000, 4001, 4002, 4003, 4005, 4009, 4012, 4015, 4016, 4020, 4900,
 ];
 
-/// Upper bound on the whole `IDENTIFY` to `SESSION_DESCRIPTION` exchange, awaited inline by the
-/// caller. Wide enough for a full IP-discovery retry cycle plus a slow voice region.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// The gateway dropped the session it was holding: no resume is possible, a fresh identify may be.
+const SESSION_NO_LONGER_VALID: u16 = 4006;
 
-/// Heartbeat intervals without an op-6 ACK before the gateway is declared dead and resumed. Only
-/// fires on a zombie socket: it reads fine, but the gateway behind it is gone.
-const MISSED_ACKS_BEFORE_DEAD: u32 = 3;
+/// Upper bound on the WebSocket connect; nothing else in the handshake is bounded.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Resume attempts before the close is reported to the client; a confirmed session restores the
 /// budget.
@@ -117,6 +115,13 @@ enum DaveEvent {
     UsersConnected { user_ids: Vec<u64> },
     /// Op 13 `CLIENT_DISCONNECT`: a user left.
     UserDisconnected { user_id: u64 },
+    /// A fresh session's replacement link, handed to the send task when its description arrives.
+    FreshSession {
+        udp: VoiceUdp,
+        transport: Box<dyn crate::transport::TransportCipher>,
+        ssrc: u32,
+        dave_protocol_version: u16,
+    },
 }
 
 /// Everything needed to join a voice channel, sourced from the main gateway's `VOICE_STATE_UPDATE`
@@ -147,40 +152,74 @@ impl VoiceServerInfo {
     }
 }
 
-/// Re-announces our speaking state on op 11/12 so clients that join after playback began get our
-/// SSRC-to-user mapping; without it late joiners hear nothing.
+/// Re-announces our speaking state when streams change (op 12) or a session description arrives,
+/// so clients that join after playback began still get our SSRC-to-user mapping.
 #[derive(Clone)]
 struct SpeakingReannounce {
     ws_tx: mpsc::UnboundedSender<Message>,
     speaking: Arc<AtomicBool>,
-    ssrc: u32,
+    ssrc: Arc<AtomicU32>,
 }
 
 impl SpeakingReannounce {
     fn announce_if_speaking(&self) {
         if self.speaking.load(Ordering::Relaxed) {
-            let _ = self.ws_tx.send(speaking_message(true, self.ssrc));
+            let ssrc = self.ssrc.load(Ordering::Relaxed);
+            let _ = self.ws_tx.send(speaking_message(true, ssrc));
         }
     }
 }
 
-/// Parameters needed to resume a dropped voice session (op 7).
-struct ResumeInfo {
+/// Everything the gateway supervisor needs to resume (op 7) or re-identify (op 0) the session.
+struct SessionInfo {
     url: String,
     server_id: u64,
+    user_id: u64,
+    channel_id: u64,
     session_id: String,
     token: String,
+}
+
+/// Fields of an op-2 `READY` describing the fresh session's voice server.
+struct ReadyVoice {
+    ssrc: u32,
+    ip: String,
+    port: u16,
+    modes: Vec<String>,
+}
+
+fn ready_from_payload(d: &Value) -> Result<ReadyVoice, String> {
+    Ok(ReadyVoice {
+        ssrc: d["ssrc"].as_u64().ok_or("READY missing ssrc")? as u32,
+        ip: d["ip"].as_str().ok_or("READY missing ip")?.to_string(),
+        port: d["port"].as_u64().ok_or("READY missing port")? as u16,
+        modes: d["modes"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|m| m.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    })
+}
+
+/// A freshly negotiated UDP link waiting for the session description that keys it.
+struct PendingLink {
+    udp: VoiceUdp,
+    mode: &'static str,
 }
 
 /// A live voice connection. Dropping it (or calling [`disconnect`](Self::disconnect)) stops all
 /// tasks.
 pub struct VoiceConnection {
     ws_tx: mpsc::UnboundedSender<Message>,
-    ssrc: u32,
+    /// Shared with the supervisor: a fresh session after a drop gets a new SSRC.
+    ssrc: Arc<AtomicU32>,
     state: Arc<AtomicU8>,
     /// Last heartbeat round-trip in milliseconds (`u64::MAX` until the first ACK).
     ping: Arc<AtomicU64>,
-    /// Shared with the send task's pacer and the op-11/12 re-announce, so an explicit
+    /// Shared with the send task's pacer and the re-announce, so an explicit
     /// [`set_speaking`](Self::set_speaking) stays consistent with what gets re-announced.
     speaking: Arc<AtomicBool>,
     dispatcher: EventDispatcher,
@@ -211,15 +250,24 @@ impl VoiceConnection {
     {
         let state = Arc::new(AtomicU8::new(ConnectionState::Connecting as u8));
         let url = info.ws_url();
-        let (ws, _response) = match timeout(HANDSHAKE_TIMEOUT, connect_async(url.as_str())).await {
+        // Everything the supervisor needs to bring this session back if the socket drops.
+        let session = SessionInfo {
+            url: url.clone(),
+            server_id: info.guild_id,
+            user_id: info.user_id,
+            channel_id: info.channel_id,
+            session_id: info.session_id.clone(),
+            token: info.token.clone(),
+        };
+        let (ws, _response) = match timeout(CONNECT_TIMEOUT, connect_async(url.as_str())).await {
             Ok(result) => result?,
             Err(_) => return Err("voice gateway connect timed out".into()),
         };
         let (mut sink, mut stream) = ws.split();
 
-        sink.send(Message::text(identify_message(&info))).await?;
+        sink.send(Message::text(identify_message(&session))).await?;
 
-        let mut ssrc = 0u32;
+        let ssrc = Arc::new(AtomicU32::new(0));
         let mut udp: Option<VoiceUdp> = None;
         let mut chosen_mode: Option<&'static str> = None;
         let mut heartbeat_interval = 41_250.0f64;
@@ -233,12 +281,9 @@ impl VoiceConnection {
         let handshake = async {
             loop {
                 let Some(message) = stream.next().await else {
-                    // Surface an abnormal drop as a gateway close rather than a bare error, so the
-                    // client still receives a close event for it.
-                    dispatcher.dispatch(VoiceEvent::GatewayClosed {
-                        code: 1006,
-                        reason: "abnormal closure".into(),
-                        by_remote: true,
+                    // Nothing is reported as a close before the session exists; the caller owns it.
+                    dispatcher.dispatch(VoiceEvent::GatewayError {
+                        message: "gateway closed during handshake".into(),
                     });
                     return Err::<(Vec<u8>, u16), ConnectError>(
                         "gateway closed during handshake".into(),
@@ -254,16 +299,14 @@ impl VoiceConnection {
                         continue;
                     }
                     // A close here carries the diagnosis the caller needs (4006 stale session, 4009
-                    // timeout, 4014 disconnected, 4004 auth failed), so dispatch it too.
+                    // timeout, 4014 disconnected, 4004 auth failed), so surface it as an error.
                     Message::Close(frame) => {
                         let (code, reason) = frame
                             .map(|f| (u16::from(f.code), f.reason.to_string()))
                             .unwrap_or((1006, String::new()));
                         tracing::warn!(code, reason = %reason, "voice: gateway closed during handshake");
-                        dispatcher.dispatch(VoiceEvent::GatewayClosed {
-                            code,
-                            reason: reason.clone(),
-                            by_remote: true,
+                        dispatcher.dispatch(VoiceEvent::GatewayError {
+                            message: format!("gateway closed during handshake: {code} {reason}"),
                         });
                         return Err(
                             format!("gateway closed during handshake: {code} {reason}").into()
@@ -288,68 +331,31 @@ impl VoiceConnection {
                             .unwrap_or(41_250.0);
                     }
                     2 => {
-                        let d = &value["d"];
-                        ssrc = d["ssrc"].as_u64().ok_or("READY missing ssrc")? as u32;
-                        let ip = d["ip"].as_str().ok_or("READY missing ip")?.to_string();
-                        let port = d["port"].as_u64().ok_or("READY missing port")? as u16;
-                        let offered: Vec<String> = d["modes"]
-                            .as_array()
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(|m| m.as_str().map(String::from))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        let mode = choose_mode(&offered).ok_or_else(|| {
-                            format!("server offered no supported mode: {offered:?}")
-                        })?;
-
-                        tracing::info!(ssrc, ip = %ip, port, mode, "voice: gateway READY");
-                        dispatcher.dispatch(VoiceEvent::GatewayReady {
-                            ssrc,
-                            ip: ip.clone(),
-                            port,
-                        });
-
-                        let remote: SocketAddr = format!("{ip}:{port}").parse()?;
-                        let socket = VoiceUdp::connect(remote).await?;
-                        let discovered = socket.discover_ip(ssrc).await?;
-                        tracing::info!(
-                            ip = %discovered.ip,
-                            port = discovered.port,
-                            "voice: external address discovered"
-                        );
-                        dispatcher.dispatch(VoiceEvent::ExternalIpDiscovered {
-                            ip: discovered.ip.clone(),
-                            port: discovered.port,
-                        });
-                        sink.send(Message::text(select_protocol_message(&discovered, mode)))
-                            .await?;
+                        let ready = ready_from_payload(&value["d"])?;
+                        ssrc.store(ready.ssrc, Ordering::Relaxed);
+                        let (socket, mode) = establish_link(
+                            &mut sink,
+                            &dispatcher,
+                            ready.ssrc,
+                            &ready.ip,
+                            ready.port,
+                            &ready.modes,
+                        )
+                        .await?;
                         chosen_mode = Some(mode);
                         udp = Some(socket);
                     }
                     4 => {
-                        let key: Vec<u8> = value["d"]["secret_key"]
-                            .as_array()
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(|n| n.as_u64().map(|x| x as u8))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        let version =
-                            value["d"]["dave_protocol_version"].as_u64().unwrap_or(0) as u16;
-                        return Ok((key, version));
+                        return Ok((
+                            session_secret_key(&value["d"]),
+                            session_dave_version(&value["d"]),
+                        ));
                     }
                     _ => {}
                 }
             }
         };
-        let (secret_key, dave_version): (Vec<u8>, u16) =
-            match timeout(HANDSHAKE_TIMEOUT, handshake).await {
-                Ok(result) => result?,
-                Err(_) => return Err("voice handshake timed out".into()),
-            };
+        let (secret_key, dave_version): (Vec<u8>, u16) = handshake.await?;
 
         let udp = udp.ok_or("never received READY")?;
         let mode = chosen_mode.ok_or("never received READY")?;
@@ -388,23 +394,25 @@ impl VoiceConnection {
             })
             .await?;
         }
-        // Send-only connection: ask the SFU for no inbound media at all.
-        let _ = ws_tx.send(media_sink_wants_message());
         // Shared speaking flag: the send task keeps it in sync, the gateway task reads it to
         // re-announce speaking when a client connects.
         let speaking = Arc::new(AtomicBool::new(false));
 
         // Store `Connected` before the tasks exist: an immediate close stores `Closed` from the
         // supervisor, and storing `Connected` after that would overwrite it and never exit.
+        let ssrc_value = ssrc.load(Ordering::Relaxed);
         state.store(ConnectionState::Connected as u8, Ordering::SeqCst);
-        tracing::info!(ssrc, "voice: connected, audio send loop running");
+        tracing::info!(
+            ssrc = ssrc_value,
+            "voice: connected, audio send loop running"
+        );
 
         let sender = tokio::spawn(send_loop(
             provider,
             udp,
             dave,
             transport,
-            ssrc,
+            ssrc.clone(),
             ws_tx.clone(),
             dave_rx,
             dispatcher.clone(),
@@ -412,26 +420,21 @@ impl VoiceConnection {
             state.clone(),
         ));
 
-        let resume = ResumeInfo {
-            url,
-            server_id: info.guild_id,
-            session_id: info.session_id,
-            token: info.token,
-        };
         let ping = Arc::new(AtomicU64::new(u64::MAX));
         let reannounce = SpeakingReannounce {
             ws_tx: ws_tx.clone(),
             speaking: speaking.clone(),
-            ssrc,
+            ssrc: ssrc.clone(),
         };
         let supervisor = tokio::spawn(gateway_loop(
-            resume,
+            session,
             sink,
             stream,
             ws_rx,
             dave_tx,
             heartbeat_interval,
             last_seq,
+            ssrc.clone(),
             state.clone(),
             ping.clone(),
             dispatcher.clone(),
@@ -450,9 +453,9 @@ impl VoiceConnection {
         })
     }
 
-    /// The connection SSRC.
+    /// The connection SSRC. Changed by a fresh session after a drop.
     pub fn ssrc(&self) -> u32 {
-        self.ssrc
+        self.ssrc.load(Ordering::Relaxed)
     }
 
     /// The last voice-gateway heartbeat round-trip latency in milliseconds, or `None` if no
@@ -482,13 +485,15 @@ impl VoiceConnection {
 
     /// Announce speaking state to the gateway.
     pub fn set_speaking(&self, speaking: bool) {
-        // Keep the shared flag in step with the announcement: the op-11/12 re-announce reads it, so
-        // a stale `true` here would tell every late joiner we are speaking after we stopped.
+        // Keep the shared flag in step with the announcement: the re-announce reads it, so a
+        // stale `true` here would tell every late joiner we are speaking after we stopped.
         self.speaking.store(speaking, Ordering::Relaxed);
-        let _ = self.ws_tx.send(speaking_message(speaking, self.ssrc));
+        let ssrc = self.ssrc.load(Ordering::Relaxed);
+        let _ = self.ws_tx.send(speaking_message(speaking, ssrc));
     }
 
-    /// Disconnect: close the gateway and stop all tasks.
+    /// Disconnect: close the gateway and stop all tasks. Silent to listeners, because the caller
+    /// initiated the close.
     pub fn disconnect(mut self) {
         self.state
             .store(ConnectionState::Closed as u8, Ordering::SeqCst);
@@ -526,9 +531,63 @@ impl Drop for VoiceConnection {
     }
 }
 
+/// Negotiate the UDP leg of a session: sink wishes, backend probe, IP discovery, protocol select,
+/// then the initial speaking reset and stream advertisement. Shared by the handshake and the
+/// supervisor's fresh-session rebuilds.
+async fn establish_link(
+    sink: &mut WsSink,
+    dispatcher: &EventDispatcher,
+    ssrc: u32,
+    ip: &str,
+    port: u16,
+    offered: &[String],
+) -> Result<(VoiceUdp, &'static str), ConnectError> {
+    let mode = choose_mode(offered)
+        .ok_or_else(|| format!("server offered no supported mode: {offered:?}"))?;
+
+    tracing::info!(ssrc, ip = %ip, port, mode, "voice: gateway READY");
+    dispatcher.dispatch(VoiceEvent::GatewayReady {
+        ssrc,
+        ip: ip.to_string(),
+        port,
+    });
+
+    sink.send(media_sink_wants_message()).await?;
+    sink.send(backend_version_message()).await?;
+
+    let remote: SocketAddr = format!("{ip}:{port}").parse()?;
+    let socket = VoiceUdp::connect(remote).await?;
+    let discovered = socket.discover_ip(ssrc).await?;
+    tracing::info!(
+        ip = %discovered.ip,
+        port = discovered.port,
+        "voice: external address discovered"
+    );
+    dispatcher.dispatch(VoiceEvent::ExternalIpDiscovered {
+        ip: discovered.ip.clone(),
+        port: discovered.port,
+    });
+    sink.send(Message::text(select_protocol_message(&discovered, mode)))
+        .await?;
+    // The speaking reset and the VIDEO stream advertisement follow the protocol select.
+    sink.send(speaking_message(false, ssrc)).await?;
+    sink.send(video_message(ssrc)).await?;
+    Ok((socket, mode))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct CapturedEvents(Mutex<Vec<VoiceEvent>>);
+
+    impl VoiceEventListener for CapturedEvents {
+        fn on_event(&self, event: &VoiceEvent) {
+            self.0.lock().unwrap().push(event.clone());
+        }
+    }
 
     fn info(endpoint: &str) -> VoiceServerInfo {
         VoiceServerInfo {
@@ -538,6 +597,17 @@ mod tests {
             session_id: "s".into(),
             token: "t".into(),
             endpoint: endpoint.into(),
+        }
+    }
+
+    fn session() -> SessionInfo {
+        SessionInfo {
+            url: "wss://x/?v=8".into(),
+            server_id: 1,
+            user_id: 2,
+            channel_id: 3,
+            session_id: "s".into(),
+            token: "t".into(),
         }
     }
 
@@ -606,29 +676,99 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_is_v8_shape_with_seq_ack() {
-        let msg = heartbeat_message(7, 42);
-        let text = msg.into_text().unwrap();
-        let value: Value = serde_json::from_str(text.as_str()).unwrap();
+    fn heartbeat_is_v8_shape_with_epoch_millis() {
+        let value: Value =
+            serde_json::from_str(heartbeat_message(42).into_text().unwrap().as_str()).unwrap();
         assert_eq!(value["op"], 3);
-        assert_eq!(value["d"]["t"], 7);
         assert_eq!(value["d"]["seq_ack"], 42);
+        let t = value["d"]["t"].as_u64().unwrap();
+        assert!(t > 1_600_000_000_000, "t must be epoch millis, got {t}");
+    }
+
+    #[test]
+    fn identify_carries_channel_id_and_dave_version() {
+        let value: Value = serde_json::from_str(&identify_message(&session())).unwrap();
+        assert_eq!(value["op"], 0);
+        assert_eq!(value["d"]["server_id"], "1");
+        assert_eq!(value["d"]["user_id"], "2");
+        assert_eq!(value["d"]["channel_id"], "3");
+        assert_eq!(value["d"]["session_id"], "s");
+        assert_eq!(value["d"]["token"], "t");
+        assert_eq!(value["d"]["video"], true);
+        assert!(value["d"]["max_dave_protocol_version"].as_u64().unwrap() >= 1);
+    }
+
+    #[test]
+    fn select_protocol_announces_codecs_and_udp_address() {
+        let discovered = DiscoveredAddress {
+            ip: "203.0.113.7".into(),
+            port: 50000,
+        };
+        let value: Value = serde_json::from_str(&select_protocol_message(
+            &discovered,
+            "aead_xchacha20_poly1305_rtpsize",
+        ))
+        .unwrap();
+        assert_eq!(value["op"], 1);
+        assert_eq!(value["d"]["protocol"], "udp");
+        assert_eq!(value["d"]["data"]["address"], "203.0.113.7");
+        assert_eq!(value["d"]["data"]["port"], 50000);
+        assert_eq!(
+            value["d"]["data"]["mode"],
+            "aead_xchacha20_poly1305_rtpsize"
+        );
+        assert_eq!(value["d"]["address"], "203.0.113.7");
+        assert_eq!(value["d"]["port"], 50000);
+        assert_eq!(value["d"]["mode"], "aead_xchacha20_poly1305_rtpsize");
+        assert_eq!(value["d"]["codecs"][0]["name"], "opus");
+        assert_eq!(value["d"]["codecs"][0]["payload_type"], 120);
+        assert_eq!(value["d"]["codecs"][0]["priority"], 1000);
+        assert_eq!(value["d"]["codecs"][0]["type"], "audio");
+    }
+
+    #[test]
+    fn video_advertises_the_audio_stream() {
+        let value: Value =
+            serde_json::from_str(video_message(4242).into_text().unwrap().as_str()).unwrap();
+        assert_eq!(value["op"], 12);
+        assert_eq!(value["d"]["audio_ssrc"], 4242);
+        assert_eq!(value["d"]["video_ssrc"], 0);
+        assert_eq!(value["d"]["rtx_ssrc"], 0);
+    }
+
+    #[test]
+    fn backend_version_probe_is_op16() {
+        let value: Value =
+            serde_json::from_str(backend_version_message().into_text().unwrap().as_str()).unwrap();
+        assert_eq!(value["op"], 16);
+        assert_eq!(value["d"], json!({}));
+    }
+
+    #[test]
+    fn initial_speaking_stop_is_op5_zero() {
+        let value: Value =
+            serde_json::from_str(speaking_message(false, 77).into_text().unwrap().as_str())
+                .unwrap();
+        assert_eq!(value["op"], 5);
+        assert_eq!(value["d"]["speaking"], 0);
+        assert_eq!(value["d"]["delay"], 0);
+        assert_eq!(value["d"]["ssrc"], 77);
+    }
+
+    #[test]
+    fn connect_timeout_is_the_gateway_default() {
+        assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(10));
     }
 
     #[test]
     fn resume_uses_op7_with_seq_ack() {
-        let resume = ResumeInfo {
-            url: "wss://x/?v=8".into(),
-            server_id: 99,
-            session_id: "sid".into(),
-            token: "tok".into(),
-        };
         let value: Value =
-            serde_json::from_str(resume_message(&resume, 12).into_text().unwrap().as_str())
+            serde_json::from_str(resume_message(&session(), 12).into_text().unwrap().as_str())
                 .unwrap();
         assert_eq!(value["op"], 7);
-        assert_eq!(value["d"]["server_id"], "99");
-        assert_eq!(value["d"]["session_id"], "sid");
+        assert_eq!(value["d"]["server_id"], "1");
+        assert_eq!(value["d"]["session_id"], "s");
+        assert_eq!(value["d"]["video"], true);
         assert_eq!(value["d"]["seq_ack"], 12);
     }
 
@@ -650,8 +790,7 @@ mod tests {
         assert!(is_resumable(None), "abnormal drop should resume");
         // A heartbeat lapse (4009) must resume, not be treated as fatal.
         assert!(is_resumable(Some(4009)));
-        // Fatal: 4004 auth failed, 4006 session no longer valid, 4011 server not found,
-        // 4014 disconnected, 4021 rate limited, 4022 all clients disconnected.
+        // Fatal to a resume: 4004 auth failed, 4006 session no longer valid (fresh identify), 4011 server not found, 4014 disconnected, 4021 rate limited, 4022 all clients disconnected.
         for code in [1000u16, 4004, 4006, 4011, 4014, 4021, 4022] {
             assert!(!is_resumable(Some(code)), "{code} should be fatal");
         }
@@ -726,18 +865,6 @@ mod tests {
     }
 
     #[test]
-    fn resume_backoff_grows_and_stays_bounded() {
-        // Voice servers cycle whole hosts at once, so the delay must grow and carry jitter while
-        // staying inside the gateway's session-resume window.
-        let delays: Vec<Duration> = (0..5).map(backoff_delay).collect();
-        for pair in delays.windows(2) {
-            assert!(pair[1] > pair[0], "{:?} must grow", delays);
-        }
-        assert!(delays[0] >= Duration::from_millis(500));
-        assert!(*delays.last().unwrap() <= Duration::from_millis(8_500));
-    }
-
-    #[test]
     fn local_close_is_normal_closure_and_sink_wants_nothing() {
         let Message::Close(Some(frame)) = close_message() else {
             panic!("expected a close frame");
@@ -748,5 +875,33 @@ mod tests {
             serde_json::from_str(media_sink_wants_message().into_text().unwrap().as_str()).unwrap();
         assert_eq!(value["op"], 15);
         assert_eq!(value["d"]["any"], 0);
+    }
+
+    #[test]
+    fn disconnect_emits_no_gateway_close() {
+        let dispatcher = EventDispatcher::new();
+        let captured = Arc::new(CapturedEvents::default());
+        dispatcher.register(captured.clone());
+        let (ws_tx, _ws_rx) = mpsc::unbounded_channel();
+        let connection = VoiceConnection {
+            ws_tx,
+            ssrc: Arc::new(AtomicU32::new(1)),
+            state: Arc::new(AtomicU8::new(ConnectionState::Connected as u8)),
+            ping: Arc::new(AtomicU64::new(u64::MAX)),
+            speaking: Arc::new(AtomicBool::new(false)),
+            dispatcher,
+            sender: None,
+            supervisor: None,
+        };
+
+        connection.disconnect();
+
+        let events = captured.0.lock().unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, VoiceEvent::GatewayClosed { .. })),
+            "a disconnect initiated by the caller must stay silent, got {events:?}"
+        );
     }
 }

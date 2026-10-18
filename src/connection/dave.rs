@@ -45,6 +45,8 @@ pub(super) fn handle_dave_event(
                 }
             }
         }
+        // Handled by the send task itself (it owns the pacer), never queued here.
+        DaveEvent::FreshSession { .. } => {}
         DaveEvent::PrepareEpoch {
             protocol_version,
             epoch,

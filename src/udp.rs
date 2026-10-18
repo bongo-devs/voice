@@ -10,11 +10,9 @@ use tokio::time::{timeout_at, Instant};
 use crate::sink::FrameSink;
 
 /// How many discovery requests to send before giving up.
-const DISCOVERY_ATTEMPTS: u32 = 40;
-/// How long to wait for a reply before resending. No audio can leave the node until the handshake
-/// finishes, so every dropped datagram costs one of these; `ATTEMPTS * INTERVAL` keeps the overall
-/// give-up ceiling at 10 s.
-const DISCOVERY_INTERVAL: Duration = Duration::from_millis(250);
+const DISCOVERY_ATTEMPTS: u32 = 10;
+/// How long to wait for a reply before resending.
+const DISCOVERY_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The external address discovered via Discord's IP discovery handshake.
 #[derive(Debug, Clone)]
@@ -102,6 +100,12 @@ pub fn parse_discovery_response(response: &[u8]) -> DiscoveredAddress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_budget_is_ten_tries_one_second_apart() {
+        assert_eq!(DISCOVERY_ATTEMPTS, 10);
+        assert_eq!(DISCOVERY_INTERVAL, Duration::from_secs(1));
+    }
 
     #[test]
     fn parses_discovery_response() {
