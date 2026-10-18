@@ -25,24 +25,25 @@ pub(super) fn handle_dave_event(
             transition_id,
         } => {
             pending.insert(transition_id, protocol_version);
-            // A downgrade to v0 (DAVE disabled): allow plaintext during the grace period. An
-            // upgrade to DAVE must stop passthrough immediately and wait for the key ratchet.
+            // A downgrade to v0 (DAVE disabled): allow plaintext during the grace period.
             if protocol_version == 0 {
                 dave.set_passthrough(true);
-            } else {
-                dave.set_encryption_required(true);
             }
-
-            // send the readiness message after processing succeeds. Transition 0 is never acked.
-            if transition_id == 0 {
-                // for Discord's explicit EXECUTE_TRANSITION event.
-                execute_transition(dave, pending, transition_id);
-            } else if protocol_version == 0 {
+            // Transition 0 is the initial handshake and is not acknowledged.
+            if transition_id != 0 {
                 let _ = ws_tx.send(transition_ready_message(transition_id));
             }
         }
         DaveEvent::ExecuteTransition { transition_id } => {
-            execute_transition(dave, pending, transition_id);
+            // A v0 downgrade tears the group down; an upgrade already installed the new epoch's
+            // ratchet in `process_commit`, so it only has to leave passthrough.
+            if let Some(protocol_version) = pending.remove(&transition_id) {
+                if protocol_version == 0 {
+                    dave.reset();
+                } else {
+                    dave.set_passthrough(false);
+                }
+            }
         }
         DaveEvent::PrepareEpoch {
             protocol_version,
@@ -57,21 +58,6 @@ pub(super) fn handle_dave_event(
                 }
                 send_key_package(dave, ws_tx);
             }
-        }
-    }
-}
-
-/// Apply a prepared protocol version when its transition executes.
-fn execute_transition(
-    dave: &mut DaveEncryptor,
-    pending: &mut HashMap<u64, u16>,
-    transition_id: u64,
-) {
-    if let Some(protocol_version) = pending.remove(&transition_id) {
-        if protocol_version == 0 {
-            dave.reset();
-        } else {
-            dave.set_passthrough(false);
         }
     }
 }
@@ -267,102 +253,5 @@ mod tests {
         let mut expected = expected_user_ids(&roster, dave.session().user_id());
         expected.sort_unstable();
         assert_eq!(expected, vec![2, 7], "roster plus self");
-    }
-
-    #[test]
-    fn dave_upgrade_waits_for_mls_before_acknowledging_transition() {
-        let mut dave = DaveEncryptor::new(7, 9).expect("create session");
-        let mut pending = HashMap::new();
-        let mut roster = HashSet::new();
-        let (ws_tx, mut ws_rx) = mpsc::unbounded_channel();
-
-        handle_dave_event(
-            &mut dave,
-            &mut pending,
-            &mut roster,
-            DaveEvent::PrepareTransition {
-                protocol_version: 1,
-                transition_id: 7,
-            },
-            &ws_tx,
-        );
-
-        assert_eq!(pending.get(&7), Some(&1));
-        assert!(
-            !dave.is_ready_to_send(),
-            "hold frames until the key is ready"
-        );
-        assert!(!dave.is_encryption_active(), "upgrade is not active yet");
-        assert!(ws_rx.try_recv().is_err(), "do not ack before MLS succeeds");
-
-        handle_dave_event(
-            &mut dave,
-            &mut pending,
-            &mut roster,
-            DaveEvent::ExecuteTransition { transition_id: 7 },
-            &ws_tx,
-        );
-
-        assert!(dave.is_encryption_active(), "execute activates DAVE");
-        assert!(
-            !dave.is_ready_to_send(),
-            "the key ratchet must still be ready before sending"
-        );
-        assert!(!pending.contains_key(&7));
-    }
-
-    #[test]
-    fn initial_transition_is_executed_during_prepare() {
-        let mut dave = DaveEncryptor::new(7, 9).expect("create session");
-        let mut pending = HashMap::new();
-        let mut roster = HashSet::new();
-        let (ws_tx, mut ws_rx) = mpsc::unbounded_channel();
-
-        handle_dave_event(
-            &mut dave,
-            &mut pending,
-            &mut roster,
-            DaveEvent::PrepareTransition {
-                protocol_version: 1,
-                transition_id: 0,
-            },
-            &ws_tx,
-        );
-
-        assert!(dave.is_encryption_active());
-        assert!(!pending.contains_key(&0));
-        assert!(ws_rx.try_recv().is_err(), "transition 0 is never acked");
-    }
-
-    #[test]
-    fn dave_downgrade_can_be_acknowledged_immediately() {
-        let mut dave = DaveEncryptor::new(7, 9).expect("create session");
-        let mut pending = HashMap::new();
-        let mut roster = HashSet::new();
-        let (ws_tx, mut ws_rx) = mpsc::unbounded_channel();
-
-        handle_dave_event(
-            &mut dave,
-            &mut pending,
-            &mut roster,
-            DaveEvent::PrepareTransition {
-                protocol_version: 0,
-                transition_id: 7,
-            },
-            &ws_tx,
-        );
-
-        assert!(
-            dave.is_ready_to_send(),
-            "downgrade permits passthrough audio"
-        );
-        let text = ws_rx
-            .try_recv()
-            .expect("downgrade is acknowledged")
-            .into_text()
-            .unwrap();
-        let message: Value = serde_json::from_str(text.as_str()).unwrap();
-        assert_eq!(message["op"], 23);
-        assert_eq!(message["d"]["transition_id"], 7);
     }
 }

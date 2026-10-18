@@ -17,8 +17,6 @@ const PROTOCOL_VERSION: NonZeroU16 = match NonZeroU16::new(davey::DAVE_PROTOCOL_
 /// Applies DAVE end-to-end encryption to Opus frames via [`davey::DaveSession`].
 pub struct DaveEncryptor {
     session: DaveSession,
-    encryption_required: bool,
-    encryption_active: bool,
 }
 
 impl DaveEncryptor {
@@ -26,29 +24,23 @@ impl DaveEncryptor {
     pub fn new(user_id: u64, channel_id: u64) -> Result<Self, davey::errors::InitError> {
         Ok(Self {
             session: DaveSession::new(PROTOCOL_VERSION, user_id, channel_id, None)?,
-            encryption_required: false,
-            encryption_active: false,
         })
     }
 
-    /// End-to-end encrypt one frame into `out`. Plaintext passthrough is allowed only when DAVE
-    /// encryption was not negotiated; a DAVE-enabled session must wait for its key ratchet.
+    /// End-to-end encrypt one frame into `out`, or pass it through unchanged before a group exists.
+    /// `false` means the group is active but encryption failed, so the caller must drop the frame.
     ///
     /// Appends rather than returning a buffer: `encrypt_opus` borrows the input during passthrough
     /// (the common case, and every frame of a non-DAVE connection), so handing back an owned buffer
     /// meant an allocation and a copy per frame — 50/s per player — that the caller then copied a
     /// second time into its RTP packet. Writing straight into that packet leaves one copy.
     pub fn encrypt_into(&mut self, packet: &[u8], out: &mut Vec<u8>) -> bool {
-        if !self.is_ready_to_send() {
-            return false;
-        }
-
         match self.session.encrypt_opus(packet) {
             Ok(encrypted) => {
                 out.extend_from_slice(&encrypted);
                 true
             }
-            Err(_) if !self.encryption_required => {
+            Err(_) if !self.session.is_ready() => {
                 out.extend_from_slice(packet);
                 true
             }
@@ -68,30 +60,7 @@ impl DaveEncryptor {
     /// Enable or disable passthrough mode (used during DAVE transitions / downgrades). When
     /// disabling, davey applies the default ~10 s transition grace period.
     pub fn set_passthrough(&mut self, enabled: bool) {
-        self.encryption_required = !enabled;
-        self.encryption_active = !enabled;
         self.session.set_passthrough_mode(enabled, None);
-    }
-
-    /// Whether the Discord session negotiated mandatory DAVE encryption.
-    pub fn set_encryption_required(&mut self, required: bool) {
-        self.encryption_required = required;
-    }
-
-    /// Set whether Discord has executed the transition that activates outbound DAVE encryption.
-    pub fn set_encryption_active(&mut self, active: bool) {
-        self.encryption_active = active;
-    }
-
-    /// Whether a nonzero DAVE protocol version is currently active for outbound audio.
-    pub fn is_encryption_active(&self) -> bool {
-        self.encryption_active
-    }
-
-    /// Whether the sender may consume and send a frame. Required encryption waits for both the
-    /// protocol transition to activate and the session's key ratchet to become ready.
-    pub fn is_ready_to_send(&self) -> bool {
-        !self.encryption_required || (self.encryption_active && self.session.is_ready())
     }
 
     /// Tear down the MLS group and clear key material, for a downgrade to DAVE v0.
@@ -100,7 +69,6 @@ impl DaveEncryptor {
         if let Err(error) = self.session.reset() {
             tracing::warn!(%error, "DAVE: failed to reset session");
         }
-        self.encryption_active = false;
     }
 
     /// Borrow the underlying session (read-only).
@@ -165,40 +133,5 @@ mod tests {
         let mut out = b"header".to_vec();
         assert!(encryptor.encrypt_into(frame, &mut out));
         assert_eq!(out, [&b"header"[..], &frame[..]].concat());
-    }
-
-    #[test]
-    fn required_encryption_blocks_passthrough_until_the_session_is_ready() {
-        let mut encryptor = DaveEncryptor::new(1234, 5678).expect("create session");
-        assert!(
-            encryptor.is_ready_to_send(),
-            "DAVE is not required by default"
-        );
-
-        encryptor.set_encryption_required(true);
-        assert!(!encryptor.is_ready_to_send());
-        assert!(!encryptor.is_encryption_active());
-        encryptor.set_encryption_active(true);
-        assert!(encryptor.is_encryption_active());
-        assert!(
-            !encryptor.is_ready_to_send(),
-            "activating the transition is not enough until the key ratchet is ready"
-        );
-        let mut out = b"header".to_vec();
-        assert!(!encryptor.encrypt_into(b"opus-frame-bytes", &mut out));
-        assert_eq!(out, b"header", "must not append plaintext audio");
-
-        encryptor.set_passthrough(true);
-        assert!(
-            encryptor.is_ready_to_send(),
-            "a DAVE downgrade permits audio"
-        );
-        let mut out = b"header".to_vec();
-        assert!(encryptor.encrypt_into(b"opus-frame-bytes", &mut out));
-        assert_eq!(
-            out,
-            [&b"header"[..], &b"opus-frame-bytes"[..]].concat(),
-            "plaintext is permitted after a DAVE downgrade"
-        );
     }
 }

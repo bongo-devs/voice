@@ -371,12 +371,6 @@ impl VoiceConnection {
         let channel_id = info.channel_id;
         let mut dave =
             tokio::task::spawn_blocking(move || DaveEncryptor::new(user_id, channel_id)).await??;
-        if dave_version == 0 {
-            dave.set_passthrough(true);
-        } else {
-            dave.set_encryption_required(true);
-            dave.set_encryption_active(true);
-        }
 
         let (ws_tx, ws_rx) = mpsc::unbounded_channel::<Message>();
 
